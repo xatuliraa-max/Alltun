@@ -103,8 +103,12 @@ def cfg(guild_id):
     for k in PERM_LABELS:
         perm.setdefault(k, [])
     bl = d.setdefault("perm_blacklist", {})  # users blocked from each permission
-    for k in ("mute", "ban", "safika", "staff", "regri"):
+    for k in ("mute", "ban", "safika", "staff", "regri", "xp"):
         bl.setdefault(k, [])
+    d.setdefault("xp_roles", [])       # roles allowed to use /xp (empty = everyone)
+    d.setdefault("xp_channels", [])    # channels where /xp works (empty = everywhere)
+    d.setdefault("love_channels", [])  # channels where ship/kiss/hug/pat work (empty = everywhere)
+    d.setdefault("love_texts", {})     # custom status texts: {"9": "...", "self": "..."} (empty = defaults)
     return d
 
 
@@ -1020,6 +1024,9 @@ async def on_message(message):
 
     content = message.content.strip()
     if not content:
+        return
+
+    if content.startswith("!!"):   # TTS (ElevenLabs) - هیچ کۆمانێک لێرە کار ناکات
         return
 
     parts = content.split()
@@ -2383,7 +2390,13 @@ class PanelChannelSelect(discord.ui.ChannelSelect):
         g = self.view.guild
         getter = {"ar": get_ar, "rk": get_rk, "rkp": get_rk, "bl": get_bl}[self.kind]
         field = "partner_channels" if self.kind == "rkp" else "channels"
-        getter(g.id)[field] = [c.id for c in self.values]
+        picked = [c.id for c in self.values]
+        if self.kind == "ar":
+            # Auto React: کەناڵی نوێ دەخرێتە سەر کەناڵە پێشووەکان (هیچ شتێک ناسڕدرێتەوە)
+            old = getter(g.id)[field]
+            getter(g.id)[field] = old + [c for c in picked if c not in old]
+        else:
+            getter(g.id)[field] = picked
         save_config()
         await panel_edit(interaction, self.view, self.kind)
 
@@ -2437,7 +2450,7 @@ def ar_embed(guild):
     e.add_field(name="کەناڵەکان", value=chans[:1000], inline=False)
     e.add_field(name=f"ئیمۆجیەکان ({len(a['emojis'])}/{AR_MAX_EMOJIS})", value=ems[:1000], inline=False)
     e.add_field(name="ڕیاکت لەسەر", value=AR_MODE_LABELS[a["mode"]], inline=False)
-    e.set_footer(text="کەناڵ هەڵبژێریت، لیستەکەی پێشوو دەگۆڕێت")
+    e.set_footer(text="کەناڵی نوێ هەڵبژێریت زیاد دەبێت بۆ پێشووەکان ✅ | بۆ لابردنی یەک کەناڵ لیستی خوارەوە بەکاربهێنە")
     return e
 
 
@@ -2467,8 +2480,38 @@ def msg_has_video(m):
     return bool(VIDEO_LINK_RX.search(m.content or ""))
 
 
+def ar_has_image(m):
+    """وەک msg_has_image، بەڵام وێنە بچووکەکەی ئیمبێدی بۆت (thumbnail) بە وێنە ناژمێردرێت"""
+    for a in m.attachments:
+        ct = (a.content_type or "").lower()
+        if ct.startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            return True
+    for e in m.embeds:
+        if e.type in ("image", "gifv") or e.image.url:
+            return True
+        if e.type != "rich" and e.thumbnail.url:
+            return True
+    return bool(IMG_LINK_RX.search(m.content or ""))
+
+
+def ar_has_text(m):
+    """دەق لە نامەکە، یان لە ناو ئیمبێدی (وەک تێکستی گۆرانی)"""
+    if (m.content or "").strip():
+        return True
+    for e in m.embeds:
+        if e.type == "rich" and (e.title or e.description or e.fields):
+            return True
+    return False
+
+
 async def ar_on_message(message):
-    if message.author.bot or message.guild is None:
+    if message.guild is None:
+        return
+    # نامەی بۆت (وەک /song-texts) ڕیاکت وەردەگرێت، بەڵام پانێل و دووگمەکان نا
+    if message.author.bot:
+        if message.components or message.id in _ar_pick:
+            return
+    if message.type not in (discord.MessageType.default, discord.MessageType.reply):
         return
     a = get_ar(message.guild.id)
     if not a["enabled"] or not a["emojis"] or not a["channels"]:
@@ -2478,8 +2521,9 @@ async def ar_on_message(message):
         return
 
     has_vid = msg_has_video(message)
-    has_img = msg_has_image(message) and not has_vid
-    has_text = bool((message.content or "").strip())
+    has_img = ar_has_image(message) and not has_vid
+    has_text = ar_has_text(message)
+    has_file = bool(message.attachments)      # ئۆدیۆ / فایل / هەر هاوپێچێک
     mode = a["mode"]
     if mode == "image":
         ok = has_img
@@ -2488,7 +2532,7 @@ async def ar_on_message(message):
     elif mode == "text":
         ok = has_text and not has_img and not has_vid
     else:
-        ok = has_img or has_vid or has_text
+        ok = has_img or has_vid or has_text or has_file or bool(message.embeds)
     if not ok:
         return
 
@@ -2528,6 +2572,27 @@ class ArRemoveSelect(discord.ui.Select):
         await panel_edit(interaction, self.view, "ar")
 
 
+class ArChannelRemoveSelect(discord.ui.Select):
+    """لابردنی یەک یان چەند کەناڵ لە لیستەکە (بەبێ ئەوەی ئەوانی تر بسڕدرێنەوە)"""
+    def __init__(self, guild, channels):
+        opts = []
+        for cid in channels[:25]:
+            ch = guild.get_channel(cid) or guild.get_thread(cid)
+            label = f"#{ch.name}" if ch else f"(کەناڵی سڕاوە) {cid}"
+            opts.append(discord.SelectOption(label=label[:100], value=str(cid)))
+        super().__init__(
+            placeholder="کەناڵ هەڵبژێرە بۆ لابردن لە لیستەکە...",
+            options=opts, min_values=1, max_values=len(opts), row=4
+        )
+
+    async def callback(self, interaction):
+        a = get_ar(self.view.guild.id)
+        gone = {int(v) for v in self.values}
+        a["channels"] = [c for c in a["channels"] if c not in gone]
+        save_config()
+        await panel_edit(interaction, self.view, "ar")
+
+
 class ArEmojiModal(discord.ui.Modal):
     def __init__(self, guild, author_id):
         super().__init__(title="Add Emojis")
@@ -2556,6 +2621,8 @@ class ArView(SecBaseView):
         self.add_item(PanelChannelSelect("ar", row=0))
         if a["emojis"]:
             self.add_item(ArRemoveSelect(a["emojis"]))
+        if a["channels"]:
+            self.add_item(ArChannelRemoveSelect(guild, a["channels"]))
         self.toggle.label = "Auto React: ON" if a["enabled"] else "Auto React: OFF"
         self.toggle.style = discord.ButtonStyle.success if a["enabled"] else discord.ButtonStyle.danger
         self.mode_btn.label = AR_MODE_LABELS[a["mode"]]
@@ -3839,6 +3906,2613 @@ async def welcome_cmd(interaction: discord.Interaction):
         view=WelcomeView(interaction.guild, interaction.user.id),
         ephemeral=True
     )
+
+
+# =========================================================
+# 29b. XP SYSTEM  (/xp  +  /setxp)
+# =========================================================
+# - XP دەدرێت بۆ نامەی چات و کاتی ڤۆیس
+# - ڕۆژانە / هەفتانە / مانگانە / ساڵانە (بە کاتی عێراق UTC+3)
+# - /xp  → جۆر (چات/ڤۆیس) → ماوە → بۆردێکی پەبلیک دەنێرێت و خۆکار نوێ دەبێتەوە
+# - /setxp → کێ و لە کوێ بتوانێت /xp بەکاربهێنێت + Blacklist
+# - داتاکە لە xp_data.json هەڵدەگیرێت (لە تەنیشت guild_config.json)
+
+import atexit as _atexit
+import signal as _signal
+import datetime as _dt
+from discord.ext import tasks as _tasks
+
+# ---- ڕێکخستنەکان (دەتوانیت ژمارەکان بگۆڕیت) ----
+XP_TZ = _dt.timezone(_dt.timedelta(hours=3))   # کاتی عێراق
+XP_CHAT_MIN, XP_CHAT_MAX = 8, 14               # XP بۆ هەر نامەیەک
+XP_CHAT_COOLDOWN = 8                           # چرکە: لە ماوەی ئەمەدا نامەی دووەم XP نادات (دژی سپام)
+XP_VOICE_PER_SEC = 1                           # XP بۆ هەر چرکەیەک لە ڤۆیس
+XP_VOICE_DEAF_MULT = 0.7                       # ئەگەر deaf بوو چەند XP وەربگرێت (0.7 = 70% | 1 = وەک ئاسایی | 0 = هیچ)
+XP_VOICE_SKIP_AFK = True                      # True = چەناڵی AFK ی سێرڤەر XP نادات | False = ئەویش XP بدات
+XP_VOICE_MIN_HUMANS = 1                       # کەمترین ژمارەی کەس لە ڤۆیس (2 = تەنیا نابێت XP وەربگرێت)
+XP_TOP = 30                                    # چەند کەس لە بۆردەکە
+XP_REFRESH = 1.0                               # هەر چەند چرکە بۆردەکە نوێ بکرێتەوە (1 = کەمترین ڕێگەپێدراو لەلایەن Discord)
+XP_SAVE_EVERY = 15                             # هەر چەند چرکە داتا لەسەر دیسک هەڵبگیرێت
+XP_MAX_BOARDS_PER_GUILD = 12
+
+XP_FILE = os.path.join(os.path.dirname(CONFIG_FILE) or ".", "xp_data.json")
+
+XP_TYPES = {
+    "chat": ("چات", "💬"),
+    "voice": ("ڤۆیس", "🎙️"),
+}
+XP_PERIODS = {
+    "d": "ڕۆژانە",
+    "w": "هەفتانە",
+    "m": "مانگانە",
+    "y": "ساڵانە",
+}
+XP_KEEP = {"d": 45, "w": 20, "m": 26, "y": 10}   # چەند ماوەی کۆن هەڵبگیرێت
+
+try:
+    with open(XP_FILE, "r", encoding="utf-8") as f:
+        xp_db = json.load(f)
+except Exception:
+    xp_db = {}
+xp_db.setdefault("users", {})    # users[guild][kind][period][period_key][user_id] = xp
+xp_db.setdefault("boards", [])   # [{"g","c","m","k","p"}]
+
+_xp_dirty = False
+_xp_board_state = {}             # message_id -> {"sig", "busy", "fails"}
+_xp_chat_last = {}
+_xp_tasks = set()                # نیشاندەری task ـەکان تا garbage collect نەکرێن
+
+
+# ---------- داتا ----------
+
+def xp_period_keys(now=None):
+    now = now or _dt.datetime.now(XP_TZ)
+    iso = now.isocalendar()
+    return {
+        "d": now.strftime("%Y-%m-%d"),
+        "w": f"{iso[0]}-W{iso[1]:02d}",
+        "m": now.strftime("%Y-%m"),
+        "y": now.strftime("%Y"),
+    }
+
+
+def xp_add(gid, uid, kind, amount, keys):
+    global _xp_dirty
+    g = xp_db["users"].setdefault(str(gid), {}).setdefault(kind, {})
+    u = str(uid)
+    for p, k in keys.items():
+        bucket = g.setdefault(p, {}).setdefault(k, {})
+        bucket[u] = bucket.get(u, 0.0) + amount
+    _xp_dirty = True
+
+
+def xp_bucket(gid, kind, period):
+    k = xp_period_keys()[period]
+    return xp_db["users"].get(str(gid), {}).get(kind, {}).get(period, {}).get(k, {})
+
+
+def xp_prune():
+    for g in xp_db["users"].values():
+        for kind in g.values():
+            for p, buckets in kind.items():
+                keep = XP_KEEP.get(p, 10)
+                for old in sorted(buckets.keys())[:-keep]:
+                    buckets.pop(old, None)
+
+
+def xp_save_now():
+    global _xp_dirty
+    try:
+        xp_prune()
+        tmp = XP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(xp_db, f, ensure_ascii=False)
+        os.replace(tmp, XP_FILE)
+        _xp_dirty = False
+    except Exception as e:
+        print(f"xp save error: {e}", flush=True)
+
+
+_atexit.register(xp_save_now)
+
+
+def _xp_on_sigterm(*_):
+    xp_save_now()
+    raise SystemExit(0)
+
+
+try:
+    _signal.signal(_signal.SIGTERM, _xp_on_sigterm)
+except Exception:
+    pass
+
+
+# ---------- وەرگرتنی XP ----------
+
+async def xp_on_message(message):
+    if message.author.bot or message.guild is None:
+        return
+    try:
+        mute_role = get_mute_role(message.guild)
+        if mute_role and mute_role in message.author.roles:
+            return
+    except Exception:
+        pass
+    now = time.time()
+    key = (message.guild.id, message.author.id)
+    if now - _xp_chat_last.get(key, 0) < XP_CHAT_COOLDOWN:
+        return
+    _xp_chat_last[key] = now
+    xp_add(message.guild.id, message.author.id, "chat",
+           random.randint(XP_CHAT_MIN, XP_CHAT_MAX), xp_period_keys())
+
+
+bot.add_listener(xp_on_message, "on_message")
+
+
+@_tasks.loop(seconds=1)
+async def xp_voice_loop():
+    try:
+        keys = xp_period_keys()
+        per_sec = XP_VOICE_PER_SEC
+        for guild in bot.guilds:
+            afk = guild.afk_channel if XP_VOICE_SKIP_AFK else None
+            for vc in list(guild.voice_channels) + list(guild.stage_channels):
+                if afk and vc.id == afk.id:
+                    continue
+                humans = [m for m in vc.members if not m.bot]
+                if len(humans) < XP_VOICE_MIN_HUMANS:
+                    continue
+                for m in humans:
+                    vs = m.voice
+                    if vs is None:
+                        continue
+                    amount = per_sec
+                    if vs.self_deaf or vs.deaf:
+                        amount *= XP_VOICE_DEAF_MULT
+                    xp_add(guild.id, m.id, "voice", amount, keys)
+                    xp_add(guild.id, m.id, "voice_time", 1, keys)   # کاتی ڤۆیس بە چرکە (deaf یش دەژمێردرێت)
+    except Exception as e:
+        print(f"xp voice loop error: {e}", flush=True)
+
+
+@_tasks.loop(seconds=XP_SAVE_EVERY)
+async def xp_save_loop():
+    if _xp_dirty:
+        xp_save_now()
+
+
+# ---------- بۆردی XP ----------
+
+def xp_top(guild, kind, period):
+    bucket = xp_bucket(guild.id, kind, period)
+    out = []
+    for uid, val in sorted(bucket.items(), key=lambda kv: kv[1], reverse=True):
+        if int(val) <= 0:
+            continue
+        m = guild.get_member(int(uid))
+        if m is None:
+            continue
+        secs = None
+        if kind == "voice":
+            secs = xp_bucket(guild.id, "voice_time", period).get(uid, 0)
+        out.append((m, int(val), secs))
+        if len(out) >= XP_TOP:
+            break
+    return out
+
+
+def xp_fmt_time(secs):
+    """11 کاتژمێر و 30 خولەک -> 11:30"""
+    mins = int(secs) // 60
+    return f"{mins // 60}:{mins % 60:02d}"
+
+
+def xp_board_embed(guild, kind, period):
+    label, emoji = XP_TYPES[kind]
+    plabel = XP_PERIODS[period]
+    rows = xp_top(guild, kind, period)
+
+    lines = [f"✧･ﾟ:  {plabel}  :･ﾟ✧", ""]
+    if not rows:
+        lines.append("هێشتا کەس XP ی نییە ♡")
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for i, (m, v, secs) in enumerate(rows, 1):
+        name = discord.utils.escape_markdown(m.display_name)[: (12 if secs is not None else 20)]
+        # کاتی ڤۆیس ڕێک لە تەنیشت XP، لە هەمان ڕیز: XP ✦ ⏱ `کات`
+        tail = f" ✦ `{xp_fmt_time(secs)}`" if secs is not None else " ✦"
+        if i <= 3:
+            xp_txt = f"{v:,}" if secs is not None else f"**{v:,}**"
+            lines.append(f"{medals[i]} **{name}** ⋆ {xp_txt}{tail}")
+            if i == 3 and len(rows) > 3:
+                lines.append("┈┈┈┈┈┈┈┈┈┈┈┈")
+        else:
+            lines.append(f"`{i:02d}` {name} ⋅ {v:,}{tail}")
+
+    e = discord.Embed(
+        title=f"{emoji}  {label} XP  ♡  Top {XP_TOP}",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.from_rgb(244, 208, 238),   # pastel pink-lilac
+    )
+    foot = "⟡ نوێ دەبێتەوە هەر چرکەیەک ⟡"
+    if kind == "voice":
+        foot += "\nکات = کاتژمێر:خولەک لە ڤۆیس"
+    e.set_footer(text=foot, icon_url=guild.icon.url if guild.icon else None)
+    return e
+
+
+def _xp_sig(embed):
+    return json.dumps(embed.to_dict(), sort_keys=True, ensure_ascii=False)
+
+
+def xp_remove_board(b):
+    try:
+        xp_db["boards"].remove(b)
+    except ValueError:
+        pass
+    _xp_board_state.pop(b["m"], None)
+    xp_save_now()
+
+
+async def xp_delete_board_message(b):
+    try:
+        await bot.get_partial_messageable(b["c"]).get_partial_message(b["m"]).delete()
+    except Exception:
+        pass
+
+
+async def xp_edit_board(b, st, embed, sig):
+    try:
+        pm = bot.get_partial_messageable(b["c"]).get_partial_message(b["m"])
+        t0 = time.time()
+        await pm.edit(embed=embed)
+        took = time.time() - t0
+        st["sig"] = sig
+        st["fails"] = 0
+        # لۆگی دواکەوتن: ئەگەر Discord هێواش بوو یان Rate Limit بوو لە Railway Logs دەردەکەوێت
+        if took > 1.0 and time.time() - st.get("last_warn", 0) > 10:
+            st["last_warn"] = time.time()
+            print(f"[XP] board edit took {took:.1f}s (Discord rate limit / slow API)", flush=True)
+    except discord.NotFound:
+        xp_remove_board(b)
+    except Exception as e:
+        st["fails"] += 1
+        if st["fails"] in (1, 30):
+            print(f"xp board edit error ({st['fails']}): {e}", flush=True)
+        if st["fails"] >= 30 and isinstance(e, discord.Forbidden):
+            xp_remove_board(b)
+    finally:
+        st["busy"] = False
+
+
+@_tasks.loop(seconds=XP_REFRESH)
+async def xp_board_loop():
+    for b in list(xp_db["boards"]):
+        st = _xp_board_state.setdefault(b["m"], {"sig": None, "busy": False, "fails": 0})
+        if st["busy"]:
+            continue
+        guild = bot.get_guild(b["g"])
+        if guild is None:
+            continue
+        try:
+            embed = xp_board_embed(guild, b["k"], b["p"])
+            sig = _xp_sig(embed)
+        except Exception as e:
+            print(f"xp board render error: {e}", flush=True)
+            continue
+        if sig == st["sig"]:
+            continue          # گۆڕانکاری نییە، پێویست بە edit نییە
+        st["busy"] = True
+        t = asyncio.create_task(xp_edit_board(b, st, embed, sig))
+        _xp_tasks.add(t)
+        t.add_done_callback(_xp_tasks.discard)
+
+
+async def xp_create_board(channel, guild, kind, period):
+    # ئەگەر هەمان بۆرد لەم کەناڵەدا هەبوو، کۆنەکە بسڕەوە
+    for old in [x for x in xp_db["boards"]
+                if x["g"] == guild.id and x["c"] == channel.id and x["k"] == kind and x["p"] == period]:
+        xp_remove_board(old)
+        await xp_delete_board_message(old)
+
+    embed = xp_board_embed(guild, kind, period)
+    msg = await channel.send(embed=embed)          # پەبلیک، هەموو کەس دەیبینێت
+    b = {"g": guild.id, "c": channel.id, "m": msg.id, "k": kind, "p": period}
+    xp_db["boards"].append(b)
+    _xp_board_state[msg.id] = {"sig": _xp_sig(embed), "busy": False, "fails": 0}
+
+    mine = [x for x in xp_db["boards"] if x["g"] == guild.id]
+    while len(mine) > XP_MAX_BOARDS_PER_GUILD:
+        xp_remove_board(mine.pop(0))
+    xp_save_now()
+    return msg
+
+
+async def xp_on_ready():
+    for loop_ in (xp_voice_loop, xp_save_loop, xp_board_loop):
+        if not loop_.is_running():
+            loop_.start()
+
+
+bot.add_listener(xp_on_ready, "on_ready")
+
+
+# ---------- دەسەڵات ----------
+
+def xp_denied_reason(interaction):
+    """None = دەتوانێت | 'deny' = دەسەڵات نییە | 'channel' = ئەم کەناڵە نابێت"""
+    m = interaction.user
+    g = interaction.guild
+    c = cfg(g.id)
+
+    chans = c["xp_channels"]
+    if chans:
+        ids = {interaction.channel_id, getattr(interaction.channel, "parent_id", None)}
+        if not (ids & set(chans)):
+            return "channel"
+
+    if m.id == g.owner_id:
+        return None
+    if is_blacklisted(m, "xp"):
+        return "deny"
+    if is_dev(m):
+        return None
+    roles = c["xp_roles"]
+    if roles and not any(r.id in roles for r in m.roles):
+        return "deny"
+    return None
+
+
+async def xp_deny(interaction, why):
+    if why == "channel":
+        chans = " ".join(f"<#{x}>" for x in cfg(interaction.guild.id)["xp_channels"])
+        try:
+            await interaction.response.send_message(
+                f"ئەم فەرمانە لێرە ناکرێت، لەم کەناڵانە بەکاری بهێنە:\n{chans}",
+                ephemeral=True, delete_after=10)
+        except Exception:
+            pass
+    else:
+        await deny_interaction(interaction)
+
+
+# ---------- /xp ----------
+
+def xp_step_embed(kind=None):
+    if kind is None:
+        return discord.Embed(
+            title="✦ XP ✦",
+            description="جۆری XP هەڵبژێرە ♡",
+            color=discord.Color.from_rgb(244, 208, 238))
+    label, emoji = XP_TYPES[kind]
+    return discord.Embed(
+        title=f"{emoji} {label} XP",
+        description="ماوەکە هەڵبژێرە ♡",
+        color=discord.Color.from_rgb(244, 208, 238))
+
+
+class XpKindView(discord.ui.View):
+    def __init__(self, author_id):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await deny_interaction(interaction)
+            return False
+        return True
+
+    async def _pick(self, interaction, kind):
+        await interaction.response.edit_message(
+            embed=xp_step_embed(kind), view=XpPeriodView(self.author_id, kind))
+
+    @discord.ui.button(label="چات", emoji="💬", style=discord.ButtonStyle.secondary)
+    async def chat_btn(self, interaction, button):
+        await self._pick(interaction, "chat")
+
+    @discord.ui.button(label="ڤۆیس", emoji="🎙️", style=discord.ButtonStyle.secondary)
+    async def voice_btn(self, interaction, button):
+        await self._pick(interaction, "voice")
+
+
+class XpPeriodView(discord.ui.View):
+    def __init__(self, author_id, kind):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.kind = kind
+        for p, label in XP_PERIODS.items():
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, row=0)
+            btn.callback = self._make_cb(p)
+            self.add_item(btn)
+        back = discord.ui.Button(label="گەڕانەوە", emoji="↩️", style=discord.ButtonStyle.primary, row=1)
+        back.callback = self._back
+        self.add_item(back)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await deny_interaction(interaction)
+            return False
+        return True
+
+    def _make_cb(self, period):
+        async def cb(interaction):
+            why = xp_denied_reason(interaction)
+            if why:
+                await xp_deny(interaction, why)
+                return
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    description=f"✅ بۆردی **{XP_TYPES[self.kind][0]} · {XP_PERIODS[period]}** نێردرا",
+                    color=discord.Color.from_rgb(244, 208, 238)),
+                view=None)
+            try:
+                await xp_create_board(interaction.channel, interaction.guild, self.kind, period)
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    "نەمتوانی لەم کەناڵە بنێرم، دەسەڵاتی Send Messages و Embed Links بدە بە بۆتەکە.",
+                    ephemeral=True)
+            except Exception as e:
+                print(f"xp create board error: {e}", flush=True)
+                await interaction.followup.send("هەڵەیەک ڕوویدا، دووبارە هەوڵ بدەوە.", ephemeral=True)
+        return cb
+
+    async def _back(self, interaction):
+        await interaction.response.edit_message(embed=xp_step_embed(), view=XpKindView(self.author_id))
+
+
+@bot.tree.command(name="xp", description="تۆپی XP ی چات و ڤۆیس پیشان بدە")
+@app_commands.guild_only()
+async def xp_cmd(interaction: discord.Interaction):
+    why = xp_denied_reason(interaction)
+    if why:
+        await xp_deny(interaction, why)
+        return
+    await interaction.response.send_message(
+        embed=xp_step_embed(), view=XpKindView(interaction.user.id), ephemeral=True)
+
+
+# ---------- /setxp ----------
+
+def xpset_embed(guild):
+    c = cfg(guild.id)
+    roles = " ".join(f"<@&{r}>" for r in c["xp_roles"]) or "🌍 هەموو کەسێک"
+    chans = " ".join(f"<#{x}>" for x in c["xp_channels"]) or "🌍 هەموو شوێنێک"
+    bl = " ".join(f"<@{u}>" for u in blacklist_list(guild.id, "xp")) or "❌"
+    e = discord.Embed(title="✦ XP Settings", color=discord.Color.from_rgb(244, 208, 238))
+    e.add_field(name="ڕۆڵەکان (کێ بتوانێت)", value=roles[:1000], inline=False)
+    e.add_field(name="کەناڵەکان (لە کوێ بتوانرێت)", value=chans[:1000], inline=False)
+    e.add_field(name="🚫 Blacklist", value=bl[:1000], inline=False)
+    e.set_footer(text="ڕۆڵ/کەناڵ: هەڵبژاردنی نوێ لیستی پێشوو دەگۆڕێت | Blacklist: زیاد / لابردن | بەتاڵ = هەموو شوێن و کەس")
+    return e
+
+
+class XpRolesSelect(discord.ui.RoleSelect):
+    def __init__(self):
+        super().__init__(placeholder="ڕۆڵەکان هەڵبژێرە (کێ بتوانێت /xp بەکاربهێنێت)...",
+                         min_values=1, max_values=25, row=0)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        cfg(g.id)["xp_roles"][:] = [r.id for r in self.values]
+        save_config()
+        await interaction.response.edit_message(
+            embed=xpset_embed(g), view=XpSetView(g, self.view.author_id))
+
+
+class XpChannelsSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="کەناڵەکان هەڵبژێرە (لە کوێ بتوانرێت)...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.voice, discord.ChannelType.news],
+            min_values=1, max_values=25, row=1)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        cfg(g.id)["xp_channels"][:] = [ch.id for ch in self.values]
+        save_config()
+        await interaction.response.edit_message(
+            embed=xpset_embed(g), view=XpSetView(g, self.view.author_id))
+
+
+class XpBlacklistSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="🚫 Blacklist — کەس هەڵبژێرە (زیاد / لابردن)...",
+                         min_values=1, max_values=25, row=2)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        _toggle_ids(blacklist_list(g.id, "xp"), [u.id for u in self.values])
+        save_config()
+        await interaction.response.edit_message(
+            embed=xpset_embed(g), view=XpSetView(g, self.view.author_id))
+
+
+class XpSetView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.add_item(XpRolesSelect())
+        self.add_item(XpChannelsSelect())
+        self.add_item(XpBlacklistSelect())
+
+    async def _refresh(self, interaction):
+        await interaction.response.edit_message(
+            embed=xpset_embed(self.guild), view=XpSetView(self.guild, self.author_id))
+
+    @discord.ui.button(label="هەموو کەسێک", emoji="🌍", style=discord.ButtonStyle.secondary, row=3)
+    async def all_people(self, interaction, button):
+        cfg(self.guild.id)["xp_roles"][:] = []
+        save_config()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="هەموو شوێنێک", emoji="🌍", style=discord.ButtonStyle.secondary, row=3)
+    async def all_places(self, interaction, button):
+        cfg(self.guild.id)["xp_channels"][:] = []
+        save_config()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Clear Blacklist", style=discord.ButtonStyle.danger, row=3)
+    async def clear_bl(self, interaction, button):
+        blacklist_list(self.guild.id, "xp")[:] = []
+        save_config()
+        await self._refresh(interaction)
+
+
+@bot.tree.command(name="setxp", description="ڕێکخستنی /xp: کێ و لە کوێ بتوانێت بەکاری بهێنێت")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def setxp_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=xpset_embed(interaction.guild),
+        view=XpSetView(interaction.guild, interaction.user.id),
+        ephemeral=True)
+
+
+# =========================================================
+# 29c. LOVE + ACTIONS  (ship / kiss / hug / pat)
+# =========================================================
+# - بنووسە:  ship @کەس   (یان وەڵامی نامەی کەسێک بدەوە بە ship)
+#   ڕێژەی خۆشەویستی نێوان تۆ و ئەو کەسە پیشان دەدات
+# - ڕێژەکە بۆ هەر دووکەس هەموو ڕۆژێک نوێ دەبێتەوە (بە کاتی عێراق)،
+#   لە هەمان ڕۆژدا هەر جارێک بپرسیت هەمان ڕێژە دەدات
+# - ship @a @b  → ڕێژەی نێوان ئەو دوو کەسە
+# - kiss / hug / pat @کەس → ماچ / باوەش / نازدان
+# ناوی فەرمانەکان لێرە دەتوانیت بیانگۆڕیت:
+
+LOVE_WORDS = ["ship"]
+LOVE_ACTIONS = {
+    "kiss": {
+        "words": ["kiss", "mach"],
+        "emoji": "💋",
+        "title": "ماچ",
+        "color": (255, 205, 222),
+        "lines": [
+            "ماچێکی ناسک لەسەر ڕوومەت 🤍",
+            "ماچێکی بچووک و بێدەنگ ✨",
+            "ماچێک وەک پەپولەیەک نیشتەوە 🦋",
+            "ماچێکی شیرین و شەرمنانە 🌷",
+        ],
+        "count": "جار ماچی کردووە",
+    },
+    "hug": {
+        "words": ["hug", "bawesh"],
+        "emoji": "🫶",
+        "title": "باوەش",
+        "color": (224, 208, 250),
+        "lines": [
+            "باوەشێکی گەرم و ئارام ☁️",
+            "باوەشێک کە هەموو شتێک ئارام دەکاتەوە 🤍",
+            "باوەشێکی توند و پڕ لە خۆشەویستی 💗",
+            "باوەشێکی نەرم وەک هەور ☁️",
+        ],
+        "count": "جار باوەشی پێداکردووە",
+    },
+    "pat": {
+        "words": ["pat", "naz"],
+        "emoji": "🎀",
+        "title": "نازدان",
+        "color": (255, 226, 212),
+        "lines": [
+            "دەستێکی نەرم بەسەر سەریدا هات 🌷",
+            "نازێکی بچووک و شیرین 🎀",
+            "بە ناسکی ناز کرا ✨",
+            "دەستێکی ئارامکەرەوە 🤍",
+        ],
+        "count": "جار نازی کردووە",
+    },
+}
+
+LOVE_COOLDOWN = 3          # چرکە: لە نێوان دوو فەرمانی یەک کەس
+LOVE_LEVELS = [            # (تا چەند %, ستێت)
+    (9,   "One-Sided Love 💔"),
+    (19,  "Toxic Love 🥀"),
+    (29,  "Forbidden Love 🖤"),
+    (39,  "Secret Love 🤫"),
+    (49,  "Platonic Love 🫂"),
+    (59,  "Family Love 🏡"),
+    (69,  "First Love 🌷"),
+    (79,  "Romantic Love ❤️"),
+    (89,  "True Love 🤍"),
+    (99,  "Eternal Love 💍"),
+    (100, "Unconditional Love ♾️"),
+]
+LOVE_SELF = "Self Love 🖤"
+
+xp_db.setdefault("love", {})     # love[guild]["a>b"][action] = ژمارە
+_love_last = {}
+
+_LOVE_ACTION_WORDS = {w: k for k, v in LOVE_ACTIONS.items() for w in v["words"]}
+
+
+def love_percent(a_id, b_id):
+    """ڕێژەی نێوان دوو کەس، هەموو ڕۆژێک نوێ دەبێتەوە، A&B و B&A هەمان ڕێژەیان هەیە"""
+    import hashlib
+    x, y = sorted((int(a_id), int(b_id)))
+    day = xp_period_keys()["d"]
+    h = hashlib.sha256(f"{x}:{y}:{day}".encode()).digest()
+    return int.from_bytes(h[:4], "big") % 101
+
+
+def love_status(p, gid=None):
+    custom = cfg(gid)["love_texts"] if gid else {}
+    for limit, label in LOVE_LEVELS:
+        if p <= limit:
+            return custom.get(str(limit)) or label
+    return LOVE_LEVELS[-1][1]
+
+
+def love_self_text(gid=None):
+    custom = cfg(gid)["love_texts"] if gid else {}
+    return custom.get("self") or LOVE_SELF
+
+
+def love_bar(p):
+    full = round(p / 10)
+    return "🩷" * full + "🤍" * (10 - full)
+
+
+def love_embed(a, b, gid=None, p=None):
+    if p is None:
+        p = 100 if a.id == b.id else love_percent(a.id, b.id)
+    text = love_self_text(gid) if a.id == b.id else love_status(p, gid)
+    desc = (
+        "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊\n\n"
+        f"{a.mention}  ˖ ♡ ˖  {b.mention}\n\n"
+        f"## ♡ {p}% ♡\n"
+        f"{love_bar(p)}\n\n"
+        f"**{text}**\n\n"
+        "-# ⋆ ڕێژەکە هەموو ڕۆژێک نوێ دەبێتەوە ⋆"
+    )
+    e = discord.Embed(description=desc, color=discord.Color.from_rgb(250, 205, 235))
+    e.set_author(name="ڕێژەی خۆشەویستی", icon_url=a.display_avatar.url)
+    e.set_thumbnail(url=b.display_avatar.url)
+    return e
+
+
+def love_count(gid, a_id, b_id, action):
+    """ژمارەی جارەکان، A بۆ B (لە یەک ئاراستەدا) و دەیگەڕێنێتەوە"""
+    global _xp_dirty
+    g = xp_db["love"].setdefault(str(gid), {})
+    rec = g.setdefault(f"{a_id}>{b_id}", {})
+    rec[action] = rec.get(action, 0) + 1
+    _xp_dirty = True
+    return rec[action]
+
+
+def action_embed(a, b, action, n):
+    spec = LOVE_ACTIONS[action]
+    desc = (
+        "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊\n\n"
+        f"{a.mention}  {spec['emoji']}  {b.mention}\n\n"
+        f"{random.choice(spec['lines'])}\n\n"
+        f"-# ⋆ {n} {spec['count']} ⋆"
+    )
+    e = discord.Embed(description=desc, color=discord.Color.from_rgb(*spec["color"]))
+    e.set_author(name=spec["title"], icon_url=a.display_avatar.url)
+    e.set_thumbnail(url=b.display_avatar.url)
+    return e
+
+
+async def love_on_message(message):
+    if message.author.bot or message.guild is None or not message.content:
+        return
+    parts = message.content.strip().split()
+    if not parts:
+        return
+    word = parts[0].lower()
+    is_love = word in LOVE_WORDS
+    action = _LOVE_ACTION_WORDS.get(word)
+    if not is_love and not action:
+        return
+
+    allowed_ch = cfg(message.guild.id)["love_channels"]
+    if allowed_ch and not ({message.channel.id, getattr(message.channel, "parent_id", None)} & set(allowed_ch)):
+        return
+
+    # کەسەکان: mention ـەکان، یان ئەو کەسەی وەڵامی نامەکەی دراوەتەوە
+    targets = [u for u in message.mentions if not u.bot]
+    if not targets and message.reference and message.reference.message_id:
+        try:
+            ref = message.reference.resolved
+            if ref is None or isinstance(ref, discord.DeletedReferencedMessage):
+                ref = await message.channel.fetch_message(message.reference.message_id)
+            if ref and not ref.author.bot:
+                targets = [ref.author]
+        except Exception:
+            pass
+
+    async def hint(text):
+        try:
+            await message.channel.send(f"{message.author.mention} {text}", delete_after=8)
+        except Exception:
+            pass
+
+    if not targets:
+        if len(parts) == 1:        # تەنها وشەکە بەتەنیا، ڕێنمایی بکە
+            await hint("کەسێک mention بکە 🌷")
+        return
+
+    now = time.time()
+    if now - _love_last.get(message.author.id, 0) < LOVE_COOLDOWN:
+        return
+    _love_last[message.author.id] = now
+
+    me = message.author
+    try:
+        if is_love:
+            a, b = (targets[0], targets[1]) if len(targets) >= 2 else (me, targets[0])
+            embed = love_embed(a, b, message.guild.id)
+        else:
+            b = targets[0]
+            if b.id == me.id:
+                await hint("ناتوانیت ئەمە بۆ خۆت بکەیت 🥺")
+                return
+            n = love_count(message.guild.id, me.id, b.id, action)
+            embed = action_embed(me, b, action, n)
+        await message.reply(embed=embed, mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f"love command error: {e}", flush=True)
+
+
+bot.add_listener(love_on_message, "on_message")
+
+
+# ---------- /setlove ----------
+
+def love_tier_ranges():
+    out, lo = [], 0
+    for limit, label in LOVE_LEVELS:
+        out.append((str(limit), f"{lo}-{limit}%" if lo != limit else f"{limit}%", label))
+        lo = limit + 1
+    return out
+
+
+def loveset_embed(guild):
+    c = cfg(guild.id)
+    chans = " ".join(f"<#{x}>" for x in c["love_channels"]) or "🌍 هەموو شوێنێک"
+    lines = []
+    for key, rng, default in love_tier_ranges():
+        cur = c["love_texts"].get(key)
+        lines.append(f"`{rng:>7}`  {cur or default}" + ("  ✏️" if cur else ""))
+    cur_self = c["love_texts"].get("self")
+    lines.append(f"`   خۆی`  {cur_self or LOVE_SELF}" + ("  ✏️" if cur_self else ""))
+    e = discord.Embed(title="🎀 Ship / Kiss / Hug / Pat — Settings",
+                      color=discord.Color.from_rgb(250, 205, 235))
+    e.add_field(name="کەناڵەکان (لە کوێ کار بکات)", value=chans[:1000], inline=False)
+    e.add_field(name="نووسینی ڕێژەکان", value="\n".join(lines)[:1000], inline=False)
+    e.set_footer(text="✏️ = گۆڕدراوە | ڕێژەیەک هەڵبژێرە بۆ گۆڕینی نووسینەکەی | بەتاڵ بنێرە = دیفەڵت")
+    return e
+
+
+class LoveTextModal(discord.ui.Modal):
+    def __init__(self, guild, author_id, key, title_txt, current):
+        super().__init__(title=f"نووسینی {title_txt}"[:45])
+        self.guild = guild
+        self.author_id = author_id
+        self.key = key
+        self.text = discord.ui.TextInput(
+            label="نووسینی نوێ (بەتاڵ = دیفەڵت)", default=current, required=False,
+            max_length=40, placeholder="بۆ نموونە: Romantic Love ❤️")
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction):
+        if not is_dev(interaction.user):
+            await deny_interaction(interaction)
+            return
+        val = self.text.value.strip()
+        texts = cfg(self.guild.id)["love_texts"]
+        if val:
+            texts[self.key] = val
+        else:
+            texts.pop(self.key, None)
+        save_config()
+        await interaction.response.edit_message(
+            embed=loveset_embed(self.guild), view=LoveSetView(self.guild, self.author_id))
+
+
+class LoveChannelsSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="کەناڵەکان هەڵبژێرە (لە کوێ کار بکات)...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.voice, discord.ChannelType.news],
+            min_values=1, max_values=25, row=0)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        cfg(g.id)["love_channels"][:] = [ch.id for ch in self.values]
+        save_config()
+        await interaction.response.edit_message(
+            embed=loveset_embed(g), view=LoveSetView(g, self.view.author_id))
+
+
+class LoveTierSelect(discord.ui.Select):
+    def __init__(self, guild):
+        c = cfg(guild.id)["love_texts"]
+        opts = []
+        for key, rng, default in love_tier_ranges():
+            opts.append(discord.SelectOption(label=f"{rng}", value=key,
+                                             description=(c.get(key) or default)[:100]))
+        opts.append(discord.SelectOption(label="خۆی (Self)", value="self",
+                                         description=(c.get("self") or LOVE_SELF)[:100]))
+        super().__init__(placeholder="✏️ ڕێژەیەک هەڵبژێرە بۆ گۆڕینی نووسینەکەی...", options=opts, row=1)
+
+    async def callback(self, interaction):
+        g = self.view.guild
+        key = self.values[0]
+        if key == "self":
+            title_txt, default = "Self", LOVE_SELF
+        else:
+            rng = {k: r for k, r, _ in love_tier_ranges()}[key]
+            title_txt = rng
+            default = dict((k, d) for k, _, d in love_tier_ranges())[key]
+        current = cfg(g.id)["love_texts"].get(key) or default
+        await interaction.response.send_modal(
+            LoveTextModal(g, self.view.author_id, key, title_txt, current))
+
+
+class LoveSetView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.add_item(LoveChannelsSelect())
+        self.add_item(LoveTierSelect(guild))
+
+    async def _refresh(self, interaction):
+        await interaction.response.edit_message(
+            embed=loveset_embed(self.guild), view=LoveSetView(self.guild, self.author_id))
+
+    @discord.ui.button(label="Preview", emoji="👁", style=discord.ButtonStyle.primary, row=2)
+    async def preview_btn(self, interaction, button):
+        me = interaction.user
+        other = interaction.guild.me or me
+        e1 = love_embed(me, other, self.guild.id, p=73)
+        e2 = action_embed(me, other, "kiss", 5)
+        await interaction.response.send_message(
+            content="👁 Preview — ship  +  kiss", embeds=[e1, e2], ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none())
+
+    @discord.ui.button(label="هەموو شوێنێک", emoji="🌍", style=discord.ButtonStyle.secondary, row=2)
+    async def all_places(self, interaction, button):
+        cfg(self.guild.id)["love_channels"][:] = []
+        save_config()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Reset Texts", style=discord.ButtonStyle.danger, row=2)
+    async def reset_texts(self, interaction, button):
+        cfg(self.guild.id)["love_texts"].clear()
+        save_config()
+        await self._refresh(interaction)
+
+
+@bot.tree.command(name="setlove", description="ڕێکخستنی ship / kiss / hug: کەناڵەکان و نووسینی ڕێژەکان")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def setlove_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(
+        embed=loveset_embed(interaction.guild),
+        view=LoveSetView(interaction.guild, interaction.user.id),
+        ephemeral=True)
+
+
+# =========================================================
+# 29d. SERVER COPY  (/create_channels)  — تەنها خاوەنی بۆت
+# =========================================================
+# - لە سێرڤەری سەرچاوە: /create_channels → "Copy this server"
+#   (ڕۆڵ، کاتێگۆری، کەناڵ، Permission ـەکان، ئیمۆجی و ڕێکخستنی سێرڤەر هەڵدەگیرێت)
+# - لە هەر سێرڤەرێکی تر: /create_channels → تێمپلەیتەکە هەڵبژێرە → Paste
+# - تێمپلەیتەکان لە فۆڵدەری server_templates هەڵدەگیرێن (لە تەنیشت guild_config.json)
+# - ڕێکخستنەکانی بۆتەکەش کۆپی دەکرێن (Safika/Mute/Staff، Auto React، Security، Reklam، Welcome ...)
+#   و ئایدی ڕۆڵ و کەناڵ و ئیمۆجییەکان دەگۆڕدرێن بۆ ئەوانەی سێرڤەری نوێ
+# - کۆپی ناکرێت: ئەندام، نامە، بۆت، Webhook، Invite، ستیکەر، Permission ـی تایبەت بە ئەندام
+# - سەلامەتی: هیچ شتێک ناسڕدرێتەوە و هیچ شتێک لە سێرڤەری سەرچاوە دەستکاری ناکرێت.
+#   سێرڤەری سەرچاوە پارێزراوە و ناتوانرێت Paste ی تێدا بکرێت.
+# - بۆتەکە لە سێرڤەری نوێ دەبێت Administrator ی هەبێت (یان Manage Roles/Channels/Emojis)
+
+import base64 as _b64
+
+CC_OWNER_ID = 1130455970494025860      # ئایدی ئەکاونتی تۆ، تەنها تۆ دەتوانیت بەکاری بهێنیت
+CC_DIR = os.path.join(os.path.dirname(CONFIG_FILE) or ".", "server_templates")
+CC_PROTECTED_GUILDS = [1556323391143813130]               # ئایدی سێرڤەرە سەرەکییەکەت لێرە دابنێ، Paste ی تێدا ناکرێت هەرگیز
+CC_MAX_EMOJIS = 250
+CC_COLOR = discord.Color.from_rgb(224, 208, 250)
+_cc_running = set()
+
+
+# ---------- هەڵگرتنی تێمپلەیت ----------
+
+def cc_valid_key(key):
+    return bool(re.fullmatch(r"[0-9_]+", key or ""))
+
+
+def cc_meta_list():
+    out = []
+    try:
+        names = os.listdir(CC_DIR)
+    except FileNotFoundError:
+        return out
+    for fn in names:
+        if fn.endswith(".meta.json"):
+            try:
+                with open(os.path.join(CC_DIR, fn), "r", encoding="utf-8") as f:
+                    out.append(json.load(f))
+            except Exception:
+                pass
+    out.sort(key=lambda m: m.get("saved_at", 0), reverse=True)
+    return out[:25]
+
+
+def cc_load(key):
+    if not cc_valid_key(key):
+        raise ValueError("bad key")
+    with open(os.path.join(CC_DIR, f"{key}.json"), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def cc_load_meta(key):
+    if not cc_valid_key(key):
+        raise ValueError("bad key")
+    with open(os.path.join(CC_DIR, f"{key}.meta.json"), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def cc_delete(key):
+    if not cc_valid_key(key):
+        return
+    for suffix in (".json", ".meta.json"):
+        try:
+            os.remove(os.path.join(CC_DIR, key + suffix))
+        except FileNotFoundError:
+            pass
+
+
+def cc_save(key, data, meta):
+    os.makedirs(CC_DIR, exist_ok=True)
+    for suffix, obj in ((".json", data), (".meta.json", meta)):
+        path = os.path.join(CC_DIR, key + suffix)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+
+
+def cc_sources():
+    """ئایدی ئەو سێرڤەرانەی لێیانەوە کۆپی کراوە، هەمیشە پارێزراون (Paste ی تێدا ناکرێت)"""
+    try:
+        with open(os.path.join(CC_DIR, "sources.json"), "r", encoding="utf-8") as f:
+            return {int(x) for x in json.load(f)}
+    except Exception:
+        return set()
+
+
+def cc_add_source(gid):
+    s = cc_sources()
+    s.add(int(gid))
+    os.makedirs(CC_DIR, exist_ok=True)
+    path = os.path.join(CC_DIR, "sources.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(sorted(s), f)
+    os.replace(path + ".tmp", path)
+
+
+_CC_ID_RE = re.compile(r"(?<!\d)\d{17,20}(?!\d)")
+
+
+def cc_remap(obj, idmap):
+    """هەموو ئایدییەکی کۆن (ڕۆڵ/کەناڵ/ئیمۆجی/سێرڤەر) دەگۆڕێت بۆ نوێیەکەی. ئایدی ئەندامەکان وەک خۆیان دەمێنن"""
+    if obj is None or isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int):
+        return idmap.get(obj, obj)
+    if isinstance(obj, str):
+        return _CC_ID_RE.sub(lambda m: str(idmap.get(int(m.group()), m.group())), obj)
+    if isinstance(obj, list):
+        return [cc_remap(x, idmap) for x in obj]
+    if isinstance(obj, dict):
+        return {(cc_remap(k, idmap) if isinstance(k, str) else k): cc_remap(v, idmap)
+                for k, v in obj.items()}
+    return obj
+
+
+def cc_updater(interaction, title):
+    state = {"t": 0.0}
+
+    async def upd(text, force=False):
+        now = time.time()
+        if not force and now - state["t"] < 1.5:
+            return
+        state["t"] = now
+        try:
+            await interaction.edit_original_response(
+                embed=discord.Embed(title=title, description=text, color=CC_COLOR), view=None)
+        except Exception:
+            pass
+    return upd
+
+
+# ---------- کۆپیکردن ----------
+
+def cc_overwrites(ch):
+    """تەنها Permission ی ڕۆڵەکان (ئەندامەکان لە سێرڤەری تر نین)"""
+    out = []
+    for target, ow in ch.overwrites.items():
+        if isinstance(target, discord.Role):
+            a, d = ow.pair()
+            out.append({"id": target.id, "a": a.value, "d": d.value})
+    return out
+
+
+def cc_channel_type(ch):
+    if isinstance(ch, discord.ForumChannel):
+        return "forum"
+    if isinstance(ch, discord.StageChannel):
+        return "stage"
+    if isinstance(ch, discord.VoiceChannel):
+        return "voice"
+    if isinstance(ch, discord.TextChannel):
+        return "news" if ch.is_news() else "text"
+    return None
+
+
+async def cc_copy(guild, upd):
+    await upd("ڕۆڵەکان...", force=True)
+    roles = [{
+        "id": r.id, "name": r.name, "color": r.colour.value, "hoist": r.hoist,
+        "mentionable": r.mentionable, "perms": r.permissions.value, "pos": r.position,
+    } for r in guild.roles if not r.is_default() and not r.managed]
+
+    await upd("کاتێگۆری و کەناڵەکان...", force=True)
+    cats = [{
+        "id": c.id, "name": c.name, "pos": c.position, "ow": cc_overwrites(c),
+    } for c in guild.categories]
+
+    chans = []
+    for ch in guild.channels:
+        t = cc_channel_type(ch)
+        if t is None:
+            continue
+        chans.append({
+            "id": ch.id, "name": ch.name, "type": t,
+            "cat": ch.category_id, "pos": ch.position,
+            "topic": getattr(ch, "topic", None),
+            "nsfw": bool(getattr(ch, "nsfw", False)),
+            "slow": getattr(ch, "slowmode_delay", 0) or 0,
+            "bitrate": getattr(ch, "bitrate", None),
+            "limit": getattr(ch, "user_limit", 0) or 0,
+            "ow": cc_overwrites(ch),
+        })
+
+    settings = {
+        "name": guild.name,
+        "verification": guild.verification_level.value,
+        "notifications": guild.default_notifications.value,
+        "content_filter": guild.explicit_content_filter.value,
+        "afk_timeout": guild.afk_timeout,
+        "afk_channel": guild.afk_channel.id if guild.afk_channel else None,
+        "system_channel": guild.system_channel.id if guild.system_channel else None,
+        "icon": None,
+    }
+    try:
+        if guild.icon:
+            settings["icon"] = _b64.b64encode(await guild.icon.read()).decode()
+    except Exception:
+        pass
+
+    emojis = []
+    for i, e in enumerate(list(guild.emojis)[:CC_MAX_EMOJIS], 1):
+        await upd(f"ئیمۆجییەکان... {i}/{min(len(guild.emojis), CC_MAX_EMOJIS)}")
+        try:
+            emojis.append({"id": e.id, "n": e.name, "d": _b64.b64encode(await e.read()).decode()})
+        except Exception:
+            pass
+
+    # ڕێکخستنەکانی بۆت (تەنها دەخوێنرێتەوە، دەستکاری ناکرێت)
+    await upd("⚙️ ڕێکخستنەکانی بۆت...", force=True)
+    bot_cfg = json.loads(json.dumps(config.get(str(guild.id), {}), ensure_ascii=False))
+
+    key = f"{int(time.time())}_{guild.id}"
+    data = {
+        "src_id": guild.id, "bot_cfg": bot_cfg,
+        "name": guild.name, "everyone_id": guild.default_role.id,
+        "everyone_perms": guild.default_role.permissions.value,
+        "settings": settings, "roles": roles, "cats": cats, "chans": chans, "emojis": emojis,
+    }
+    meta = {
+        "key": key, "name": guild.name, "saved_at": int(time.time()), "src_id": guild.id,
+        "roles": len(roles), "cats": len(cats), "chans": len(chans), "emojis": len(emojis),
+    }
+    cc_save(key, data, meta)
+    cc_add_source(guild.id)
+    return meta
+
+
+# ---------- دانانەوە ----------
+
+async def cc_paste(guild, tpl, upd):
+    res = {"roles": 0, "cats": 0, "chans": 0, "emojis": 0, "fallback": 0, "cfg": 0, "fail": []}
+    me = guild.me
+    bot_admin = me.guild_permissions.administrator
+    bot_perms = me.guild_permissions.value
+    reason = "Server copy"
+
+    def fail(what, ex):
+        res["fail"].append(f"{what}: {str(ex)[:80]}")
+
+    # ---- ڕۆڵەکان ----
+    role_map = {tpl["everyone_id"]: guild.default_role}
+    try:
+        ev = tpl["everyone_perms"] if bot_admin else tpl["everyone_perms"] & bot_perms
+        await guild.default_role.edit(permissions=discord.Permissions(ev), reason=reason)
+    except Exception as ex:
+        fail("@everyone", ex)
+
+    existing = {r.name: r for r in guild.roles if not r.is_default() and not r.managed}
+
+    # لە بەرزەوە بۆ خوارەوە دروست دەکرێن، چونکە ڕۆڵی نوێ دەکەوێتە خوار ئەوانی پێشوو
+    roles_sorted = sorted(tpl["roles"], key=lambda r: -r["pos"])
+    for i, rd in enumerate(roles_sorted, 1):
+        await upd(f"🎭 ڕۆڵەکان... {i}/{len(roles_sorted)}")
+        if rd["name"] in existing:
+            role_map[rd["id"]] = existing[rd["name"]]
+            continue
+        perms = rd["perms"] if bot_admin else rd["perms"] & bot_perms
+        try:
+            role = await guild.create_role(
+                name=rd["name"], permissions=discord.Permissions(perms),
+                colour=discord.Colour(rd["color"]), hoist=rd["hoist"],
+                mentionable=rd["mentionable"], reason=reason)
+            role_map[rd["id"]] = role
+            res["roles"] += 1
+        except Exception as ex:
+            fail(f"@{rd['name']}", ex)
+
+    def ow_map(items):
+        out = {}
+        for o in items:
+            role = role_map.get(o["id"])
+            if role is None:
+                continue
+            allow = o["a"] if bot_admin else o["a"] & bot_perms
+            out[role] = discord.PermissionOverwrite.from_pair(
+                discord.Permissions(allow), discord.Permissions(o["d"]))
+        return out
+
+    # ---- کاتێگۆریەکان ----
+    cat_map = {}
+    cats_sorted = sorted(tpl["cats"], key=lambda c: c["pos"])
+    for i, cd in enumerate(cats_sorted, 1):
+        await upd(f"📁 کاتێگۆریەکان... {i}/{len(cats_sorted)}")
+        try:
+            cat_map[cd["id"]] = await guild.create_category(
+                cd["name"], overwrites=ow_map(cd["ow"]), reason=reason)
+            res["cats"] += 1
+        except Exception as ex:
+            fail(f"category {cd['name']}", ex)
+
+    # ---- کەناڵەکان ----
+    chan_map = {}
+    bit_limit = getattr(guild, "bitrate_limit", 96000)
+    chans_sorted = sorted(tpl["chans"], key=lambda c: c["pos"])
+
+    async def make(cd, t, cat, ow):
+        kw = {"overwrites": ow, "reason": reason}
+        if cat is not None:
+            kw["category"] = cat
+        if t in ("text", "news"):
+            extra = {"news": True} if t == "news" else {}
+            return await guild.create_text_channel(
+                cd["name"], topic=cd.get("topic") or None, nsfw=cd.get("nsfw", False),
+                slowmode_delay=cd.get("slow", 0) or 0, **extra, **kw)
+        if t == "voice":
+            return await guild.create_voice_channel(
+                cd["name"], bitrate=min(cd.get("bitrate") or 64000, bit_limit),
+                user_limit=cd.get("limit", 0) or 0, **kw)
+        if t == "stage":
+            return await guild.create_stage_channel(
+                cd["name"], topic=cd.get("topic") or cd["name"], **kw)
+        if t == "forum":
+            return await guild.create_forum(
+                cd["name"], topic=cd.get("topic") or None, nsfw=cd.get("nsfw", False),
+                slowmode_delay=cd.get("slow", 0) or 0, **kw)
+        raise ValueError(f"unknown type {t}")
+
+    fallback_type = {"news": "text", "forum": "text", "stage": "voice"}
+    for i, cd in enumerate(chans_sorted, 1):
+        await upd(f"💬 کەناڵەکان... {i}/{len(chans_sorted)}")
+        cat = cat_map.get(cd["cat"])
+        ow = ow_map(cd["ow"])
+        try:
+            try:
+                ch = await make(cd, cd["type"], cat, ow)
+            except (discord.HTTPException, TypeError) as ex:
+                fb = fallback_type.get(cd["type"])
+                if fb is None:
+                    raise
+                ch = await make(cd, fb, cat, ow)     # Community چالاک نییە → جۆری ئاسایی
+                res["fallback"] += 1
+            chan_map[cd["id"]] = ch
+            res["chans"] += 1
+        except Exception as ex:
+            fail(f"#{cd['name']}", ex)
+
+    # ---- ڕێکخستنی سێرڤەر ----
+    await upd("⚙️ ڕێکخستنی سێرڤەر...", force=True)
+    st = tpl["settings"]
+    base = {"name": st["name"]}
+    for k, attr, enum in (("verification", "verification_level", discord.VerificationLevel),
+                          ("notifications", "default_notifications", discord.NotificationLevel),
+                          ("content_filter", "explicit_content_filter", discord.ContentFilter)):
+        try:
+            base[attr] = enum(st[k])
+        except Exception:
+            pass
+    base["afk_timeout"] = st.get("afk_timeout", 300)
+    if st.get("afk_channel") in chan_map and isinstance(chan_map[st["afk_channel"]], discord.VoiceChannel):
+        base["afk_channel"] = chan_map[st["afk_channel"]]
+    if st.get("system_channel") in chan_map and isinstance(chan_map[st["system_channel"]], discord.TextChannel):
+        base["system_channel"] = chan_map[st["system_channel"]]
+    try:
+        kw = dict(base)
+        if st.get("icon"):
+            kw["icon"] = _b64.b64decode(st["icon"])
+        await guild.edit(reason=reason, **kw)
+    except Exception as ex:
+        try:
+            await guild.edit(reason=reason, name=st["name"])
+        except Exception as ex2:
+            fail("server settings", ex2)
+
+    # ---- ئیمۆجی ----
+    bad = 0
+    emoji_map = {}
+    for i, ed in enumerate(tpl.get("emojis", []), 1):
+        await upd(f"😀 ئیمۆجییەکان... {i}/{len(tpl['emojis'])}")
+        try:
+            new_e = await guild.create_custom_emoji(
+                name=ed["n"], image=_b64.b64decode(ed["d"]), reason=reason)
+            if ed.get("id"):
+                emoji_map[ed["id"]] = new_e.id
+            res["emojis"] += 1
+            bad = 0
+        except Exception as ex:
+            bad += 1
+            if bad >= 5:                       # لیمیتی ئیمۆجی پڕ بووە
+                fail("emojis", "limit reached / stopped")
+                break
+
+    # ---- ڕێکخستنەکانی بۆت: ئایدی کۆن → نوێ ----
+    await upd("⚙️ ڕێکخستنەکانی بۆت...", force=True)
+    try:
+        idmap = {}
+        idmap.update({int(k): v.id for k, v in role_map.items()})
+        idmap.update({int(k): v.id for k, v in cat_map.items()})
+        idmap.update({int(k): v.id for k, v in chan_map.items()})
+        idmap.update({int(k): int(v) for k, v in emoji_map.items()})
+        if tpl.get("src_id"):
+            idmap[int(tpl["src_id"])] = guild.id
+        old_cfg = tpl.get("bot_cfg") or {}
+        blob = json.dumps(old_cfg, ensure_ascii=False)
+        res["cfg"] = sum(1 for k in idmap if str(k) in blob)
+        new_cfg = cc_remap(old_cfg, idmap)
+        ct = new_cfg.get("counting")
+        if isinstance(ct, dict):                 # ژمارەکە لە سەرەتاوە دەست پێ بکات
+            ct["last"] = 0
+            ct["last_user"] = None
+        config.setdefault(str(guild.id), {}).update(new_cfg)
+        save_config()
+    except Exception as ex:
+        fail("bot settings", ex)
+    return res
+
+
+def cc_summary_embed(title, res):
+    desc = (f"🎭 ڕۆڵ: **{res['roles']}**\n"
+            f"📁 کاتێگۆری: **{res['cats']}**\n"
+            f"💬 کەناڵ: **{res['chans']}**\n"
+            f"😀 ئیمۆجی: **{res['emojis']}**\n"
+            f"⚙️ ڕێکخستنی بۆت: **کۆپی کرا** ({res['cfg']} ئایدی گۆڕدرا)")
+    if res["fallback"]:
+        desc += f"\n\nℹ️ {res['fallback']} کەناڵ (Announcement/Forum/Stage) وەک کەناڵی ئاسایی دروست کرا، چونکە Community لەم سێرڤەرە چالاک نییە."
+    if res["fail"]:
+        desc += f"\n\n⚠️ **{len(res['fail'])} هەڵە:**\n" + "\n".join(f"• {x}" for x in res["fail"][:8])
+    return discord.Embed(title=title, description=desc[:4000], color=CC_COLOR)
+
+
+# ---------- پانێل ----------
+
+def cc_main_embed():
+    metas = cc_meta_list()
+    e = discord.Embed(
+        title="🪞 Server Copy",
+        description=("**📥 Copy this server** → ئەم سێرڤەرە هەڵدەگرێت\n"
+                     "**تێمپلەیتێک هەڵبژێرە** → لە سێرڤەری ئێستا دایبنێوە"),
+        color=CC_COLOR)
+    if metas:
+        lines = [f"**{m['name']}** ⋅ 🎭 {m['roles']} ⋅ 📁 {m['cats']} ⋅ 💬 {m['chans']} ⋅ 😀 {m['emojis']}"
+                 for m in metas]
+        e.add_field(name="تێمپلەیتە هەڵگیراوەکان", value="\n".join(lines)[:1000], inline=False)
+    else:
+        e.add_field(name="تێمپلەیتە هەڵگیراوەکان", value="هێشتا هیچ نییە", inline=False)
+    return e
+
+
+def cc_tpl_embed(meta):
+    return discord.Embed(
+        title=f"📦 {meta['name']}",
+        description=(f"🎭 ڕۆڵ: **{meta['roles']}**\n📁 کاتێگۆری: **{meta['cats']}**\n"
+                     f"💬 کەناڵ: **{meta['chans']}**\n😀 ئیمۆجی: **{meta['emojis']}**\n\n"
+                     "**📤 Paste** → ڕۆڵ و کەناڵ و ڕێکخستنی بۆت دادەنێت\n"
+                     "هیچ شتێک ناسڕدرێتەوە، تەنها زیاد دەکرێت"),
+        color=CC_COLOR)
+
+
+class CcBaseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=600)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != CC_OWNER_ID:
+            await deny_interaction(interaction)
+            return False
+        return True
+
+
+class CcTemplateSelect(discord.ui.Select):
+    def __init__(self, metas):
+        opts = [discord.SelectOption(
+            label=m["name"][:100], value=m["key"],
+            description=f"{m['roles']} ڕۆڵ ⋅ {m['cats']} کاتێگۆری ⋅ {m['chans']} کەناڵ ⋅ {m['emojis']} ئیمۆجی")
+            for m in metas]
+        super().__init__(placeholder="📦 تێمپلەیتێک هەڵبژێرە...", options=opts, row=1)
+
+    async def callback(self, interaction):
+        key = self.values[0]
+        try:
+            meta = cc_load_meta(key)
+        except Exception:
+            await interaction.response.edit_message(embed=cc_main_embed(), view=CcMainView())
+            return
+        await interaction.response.edit_message(embed=cc_tpl_embed(meta), view=CcTplView(key))
+
+
+class CcMainView(CcBaseView):
+    def __init__(self):
+        super().__init__()
+        metas = cc_meta_list()
+        if metas:
+            self.add_item(CcTemplateSelect(metas))
+
+    @discord.ui.button(label="Copy this server", emoji="📥", style=discord.ButtonStyle.primary, row=0)
+    async def copy_btn(self, interaction, button):
+        g = interaction.guild
+        if g.id in _cc_running:
+            await interaction.response.send_message("کارێک لەم سێرڤەرە بەردەوامە، چاوەڕێ بکە.", ephemeral=True)
+            return
+        _cc_running.add(g.id)
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="📥 کۆپیکردن", description="دەستی پێکرد...", color=CC_COLOR), view=None)
+        upd = cc_updater(interaction, "📥 کۆپیکردن")
+        try:
+            meta = await cc_copy(g, upd)
+            note = discord.Embed(
+                title="✅ هەڵگیرا",
+                description=(f"**{meta['name']}**\n🎭 {meta['roles']} ⋅ 📁 {meta['cats']} ⋅ "
+                             f"💬 {meta['chans']} ⋅ 😀 {meta['emojis']}"),
+                color=CC_COLOR)
+        except Exception as ex:
+            print(f"cc copy error: {ex}", flush=True)
+            note = discord.Embed(title="❌ هەڵە", description=str(ex)[:500], color=discord.Color.red())
+        finally:
+            _cc_running.discard(g.id)
+        try:
+            await interaction.edit_original_response(embeds=[note, cc_main_embed()], view=CcMainView())
+        except Exception:
+            pass
+
+
+class CcTplView(CcBaseView):
+    def __init__(self, key):
+        super().__init__()
+        self.key = key
+
+    @discord.ui.button(label="Paste", emoji="📤", style=discord.ButtonStyle.primary, row=0)
+    async def paste_btn(self, interaction, button):
+        await self._ask(interaction, "paste")
+
+    @discord.ui.button(label="Delete saved copy", emoji="🗑", style=discord.ButtonStyle.secondary, row=1)
+    async def del_btn(self, interaction, button):
+        await self._ask(interaction, "delete")
+
+    @discord.ui.button(label="Back", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back_btn(self, interaction, button):
+        await interaction.response.edit_message(embed=cc_main_embed(), view=CcMainView())
+
+    async def _ask(self, interaction, mode):
+        try:
+            meta = cc_load_meta(self.key)
+        except Exception:
+            await interaction.response.edit_message(embed=cc_main_embed(), view=CcMainView())
+            return
+        g = interaction.guild
+        if mode == "delete":
+            text = (f"کۆپییە هەڵگیراوەکەی **{meta['name']}** لە بۆتەکە بسڕدرێتەوە؟\n"
+                    "(ئەمە هیچ کاریگەرییەکی لەسەر هیچ سێرڤەرێک نییە)")
+        else:
+            text = f"تێمپلەیتی **{meta['name']}** لە **{g.name}** دابنرێت؟ (هیچ شتێک ناسڕدرێتەوە)"
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="دڵنیایت؟", description=text, color=discord.Color.orange()),
+            view=CcConfirmView(self.key, mode))
+
+
+class CcConfirmView(CcBaseView):
+    def __init__(self, key, mode):
+        super().__init__()
+        self.key = key
+        self.mode = mode
+
+    @discord.ui.button(label="بەڵێ", emoji="✅", style=discord.ButtonStyle.success, row=0)
+    async def yes_btn(self, interaction, button):
+        if self.mode == "delete":
+            cc_delete(self.key)
+            await interaction.response.edit_message(embed=cc_main_embed(), view=CcMainView())
+            return
+        await self._run(interaction)
+
+    @discord.ui.button(label="نەخێر", emoji="✖️", style=discord.ButtonStyle.secondary, row=0)
+    async def no_btn(self, interaction, button):
+        try:
+            meta = cc_load_meta(self.key)
+            await interaction.response.edit_message(embed=cc_tpl_embed(meta), view=CcTplView(self.key))
+        except Exception:
+            await interaction.response.edit_message(embed=cc_main_embed(), view=CcMainView())
+
+    async def _run(self, interaction):
+        g = interaction.guild
+        user = interaction.user
+        # سێرڤەری سەرچاوە هەمیشە پارێزراوە، هیچ شتێکی تێدا دانانرێت
+        try:
+            src_id = cc_load_meta(self.key).get("src_id")
+        except Exception:
+            src_id = None
+        if g.id in cc_sources() or g.id == src_id or g.id in CC_PROTECTED_GUILDS:
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="🛡 پارێزراوە",
+                    description="ئەم سێرڤەرە سەرچاوەی کۆپییە و Paste ی تێدا ناکرێت. لە سێرڤەرێکی نوێ بەکاری بهێنە.",
+                    color=discord.Color.orange()),
+                view=CcMainView())
+            return
+        # دەبێت لەو سێرڤەرە Administrator بیت (یان خاوەن)
+        if g.owner_id != user.id and not user.guild_permissions.administrator:
+            await deny_interaction(interaction)
+            return
+        perms = g.me.guild_permissions
+        if not (perms.administrator or (perms.manage_channels and perms.manage_roles)):
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title="❌ دەسەڵات نییە",
+                    description="بۆتەکە پێویستی بە **Administrator** (یان Manage Channels + Manage Roles) هەیە لەم سێرڤەرە.",
+                    color=discord.Color.red()),
+                view=CcMainView())
+            return
+        if g.id in _cc_running:
+            await interaction.response.send_message("کارێک لەم سێرڤەرە بەردەوامە، چاوەڕێ بکە.", ephemeral=True)
+            return
+        try:
+            tpl = cc_load(self.key)
+        except Exception:
+            await interaction.response.edit_message(embed=cc_main_embed(), view=CcMainView())
+            return
+
+        _cc_running.add(g.id)
+        title = "📤 Paste"
+        await interaction.response.edit_message(
+            embed=discord.Embed(title=title, description="دەستی پێکرد...", color=CC_COLOR), view=None)
+        upd = cc_updater(interaction, title)
+        try:
+            res = await cc_paste(g, tpl, upd)
+            note = cc_summary_embed("✅ تەواو بوو", res)
+        except Exception as ex:
+            print(f"cc paste error: {ex}", flush=True)
+            note = discord.Embed(title="❌ هەڵە", description=str(ex)[:500], color=discord.Color.red())
+        finally:
+            _cc_running.discard(g.id)
+        try:
+            await interaction.edit_original_response(embeds=[note, cc_main_embed()], view=CcMainView())
+        except Exception:
+            # کەناڵی فەرمانەکە ڕەنگە سڕابێتەوە / تۆکنی ئینتەراکشن بەسەرچووبێت
+            pass
+
+
+@bot.tree.command(name="create_channels", description="کۆپیکردن و دانانەوەی سێرڤەر (تەنها خاوەنی بۆت)")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def create_channels_cmd(interaction: discord.Interaction):
+    if interaction.user.id != CC_OWNER_ID:
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_message(embed=cc_main_embed(), view=CcMainView(), ephemeral=True)
+
+
+# =========================================================
+# 29e. SONG TEXTS  (/song-texts)  — هەموو کەسێک دەتوانێت بەکاری بهێنێت
+# =========================================================
+# پانێلێک (تەنها بۆ خۆی دیارە):
+#   🎤 ناوی گۆرانیبێژ + ناوی گۆرانی  |  📝 تێکست  |  🖼 وێنە  |  🎧 فایل (MP3 / ئۆدیۆ / ڤیدیۆ)
+#   🔤 فۆنتی ناوی گۆرانیبێژ  |  👁 Preview  |  📤 Send
+# Send → بۆردێکی جوان + وێنە + فایلی MP3 بە شێوەی پەبلیک دەنێرێت بۆ ناو چاتەکە
+# ڤیدیۆ یان ئۆدیۆی تر خۆکار دەگۆڕدرێت بۆ MP3 (پێویستی بە ffmpeg هەیە):
+#   Railway: لە requirements.txt بنووسە  imageio-ffmpeg  (یان ffmpeg لە nixpacks زیاد بکە)
+
+import io as _io
+import shutil as _shutil
+import tempfile as _tempfile
+
+SONG_COLOR = discord.Color.from_rgb(250, 205, 235)
+SONG_COOLDOWN = 30                    # چرکە لە نێوان دوو ناردنی یەک کەس
+SONG_WAIT = 120                       # چرکە بۆ ناردنی وێنە/فایل
+SONG_MAX_IMG = 8 * 1024 * 1024
+SONG_MAX_IN = 100 * 1024 * 1024       # گەورەترین فایلی ڤیدیۆ/ئۆدیۆ کە وەربگیرێت
+SONG_AUDIO_EXT = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus", ".wma", ".oga", ".amr"}
+SONG_VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".3gp", ".flv", ".wmv"}
+SONG_IMG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+_song_last = {}
+
+
+# ---------- فۆنتەکان (پیتی لاتینی) ----------
+
+def _song_range(up, low):
+    def f(ch):
+        o = ord(ch)
+        if 65 <= o <= 90:
+            return chr(up + o - 65)
+        if 97 <= o <= 122:
+            return chr(low + o - 97)
+        return ch
+    return f
+
+
+_SMALLCAPS = dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ"))
+
+SONG_FONTS = {
+    "script":     ("Script",      _song_range(0x1D4D0, 0x1D4EA)),
+    "fraktur":    ("Fraktur",     _song_range(0x1D56C, 0x1D586)),
+    "bold":       ("Bold",        _song_range(0x1D400, 0x1D41A)),
+    "bolditalic": ("Bold Italic", _song_range(0x1D468, 0x1D482)),
+    "mono":       ("Mono",        _song_range(0x1D670, 0x1D68A)),
+    "smallcaps":  ("Small Caps",  lambda ch: _SMALLCAPS.get(ch.lower(), ch) if ch.isascii() and ch.isalpha() else ch),
+    "normal":     ("Normal",      lambda ch: ch),
+}
+
+
+def song_style(text, font):
+    fn = SONG_FONTS.get(font, SONG_FONTS["script"])[1]
+    return "".join(fn(c) for c in text)
+
+
+# ---------- یارمەتیدەرەکان ----------
+
+class SongSession:
+    def __init__(self):
+        self.artist = ""
+        self.title = ""
+        self.lyrics = ""
+        self.cover = None
+        self.cover_fn = None
+        self.audio = None
+        self.audio_ext = ".mp3"
+        self.font = "script"
+        self.note = ""
+        self.friends = []                 # مێنشنی کەسانی تر (تەنها وەک تاگ، بێ وێنە)
+
+    def clear_files(self):
+        self.cover = None
+        self.audio = None
+
+
+def song_filename(s):
+    base = f"{s.artist} - {s.title}" if s.artist else s.title
+    base = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", base)
+    base = re.sub(r"\s+", " ", base).strip()[:80] or "song"
+    return base + s.audio_ext
+
+
+def song_split(text, limit=3500):
+    pages, cur = [], ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                pages.append(cur)
+                cur = ""
+            pages.append(line[:limit])
+            line = line[limit:]
+        add = (cur + "\n" + line) if cur else line
+        if len(add) > limit:
+            pages.append(cur)
+            cur = line
+        else:
+            cur = add
+    if cur:
+        pages.append(cur)
+    return pages or [""]
+
+
+def song_size(n):
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+SONG_CENTER_W = 26      # پانی دیاریکراوی دیزاینەکە بۆ ناوەڕاست کردن (ئەگەر کەم/زۆر لە ناوەڕاست بوو ئەمە بگۆڕە)
+SONG_BLANK = "\u2800"   # بۆشایی نادیار بۆ ناوەڕاست کردن (Discord بۆشایی ئاسایی دەسڕێتەوە)
+
+
+def song_signature(s, user):
+    """ئیمزا: مێنشنی خۆت + کەسانی تر، لە ناوەڕاستدا بە شێوازی جوان، لەناو هەمان بۆکس"""
+    members = [(user.mention, user.display_name)]
+    for uid, name, mention in s.friends:
+        if uid != user.id:
+            members.append((mention, name))
+    width = sum(len(n) + 1 for _, n in members) + 3 * len(members) + 2 * (len(members) - 1)
+    pad = max(0, int((SONG_CENTER_W - 1.5 * width) / 3))
+    body = " ✧ ".join(m for m, _ in members)
+    return f"### {SONG_BLANK * pad}♡ {body} ♡"
+
+
+def song_build(s, user):
+    """بۆرد(ەکان): یەکەم بۆرد = سەر + ئیمزا (مێنشن) + تێکست، ئەگەر تێکست درێژ بوو بۆردی زیاتر"""
+    text = re.sub(r"\n{3,}", "\n\n", s.lyrics.strip())
+    pages = song_split(discord.utils.escape_markdown(text))
+    head = "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊"
+    # ئیمزا پێش تێکستەکە دادەنرێت، چونکە >>> هەموو شتێکی دوای خۆی دەخاتە ناو quote
+    desc = head + "\n" + song_signature(s, user) + (f"\n\n>>> {pages[0]}" if text else "")
+    e = discord.Embed(title=f"♪ {s.title}"[:250], description=desc[:4000], color=SONG_COLOR)
+    if s.artist:
+        e.set_author(name=song_style(s.artist, s.font)[:250])
+    # وێنەی خۆت: ئەگەر وێنەی گۆرانی نەبوو وەک thumbnail، ئەگەر هەبوو لە footer
+    if s.cover_fn:
+        e.set_thumbnail(url=f"attachment://{s.cover_fn}")
+        e.set_footer(text=song_style(user.display_name, s.font)[:100], icon_url=user.display_avatar.url)
+    else:
+        e.set_thumbnail(url=user.display_avatar.url)
+    embeds = [e]
+    if text:
+        for p in pages[1:]:
+            embeds.append(discord.Embed(description=f">>> {p}"[:4000], color=SONG_COLOR))
+    return embeds
+
+
+def song_files(s, with_audio):
+    files = []
+    if s.cover and s.cover_fn:
+        files.append(discord.File(_io.BytesIO(s.cover), filename=s.cover_fn))
+    if with_audio and s.audio:
+        files.append(discord.File(_io.BytesIO(s.audio), filename=song_filename(s)))
+    return files
+
+
+def song_panel_embed(s):
+    ok, no = "✅", "⬜"
+    artist = song_style(s.artist, s.font) if s.artist else no
+    lines = [
+        f"🎤 **گۆرانیبێژ:** {artist}",
+        f"🎵 **گۆرانی:** {s.title or no}",
+        f"📝 **تێکست:** {f'{ok} {len(s.lyrics):,} پیت' if s.lyrics else no}",
+        f"🖼 **وێنە:** {f'{ok} {song_size(len(s.cover))}' if s.cover else no}",
+        f"🎧 **فایل:** {f'{ok} {song_filename(s)} ⋅ {song_size(len(s.audio))}' if s.audio else no}",
+        f"🔤 **فۆنت:** {SONG_FONTS[s.font][0]}",
+        f"👥 **مێنشن:** {' '.join(m for _, _, m in s.friends) if s.friends else no}",
+    ]
+    e = discord.Embed(
+        title="🎶 Song Texts",
+        description="\n".join(lines) + "\n\n-# هەموو بەشەکان ئارەزوومەندانەن، تەنها ناوی گۆرانی پێویستە ⋆ پاشان 👁 Preview و 📤 Send",
+        color=SONG_COLOR)
+    if s.note:
+        e.add_field(name="ℹ️", value=s.note[:500], inline=False)
+    return e
+
+
+# ---------- ffmpeg ----------
+
+def song_ffmpeg():
+    p = _shutil.which("ffmpeg")
+    if p:
+        return p
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+async def song_to_mp3(data, in_name, limit):
+    """(bytes, None) یان (None, هۆکار)"""
+    ff = song_ffmpeg()
+    if not ff:
+        return None, "no-ffmpeg"
+    ext = os.path.splitext(in_name)[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,5}", ext):
+        ext = ".bin"
+    with _tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in" + ext)
+        dst = os.path.join(d, "out.mp3")
+        with open(src, "wb") as f:
+            f.write(data)
+        for br in ("128k", "96k", "64k"):
+            proc = await asyncio.create_subprocess_exec(
+                ff, "-y", "-i", src, "-vn", "-map", "0:a:0", "-c:a", "libmp3lame",
+                "-b:a", br, "-ar", "44100", dst,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return None, "timeout"
+            if proc.returncode != 0 or not os.path.exists(dst):
+                return None, "ffmpeg-fail"
+            with open(dst, "rb") as f:
+                out = f.read()
+            if len(out) <= limit:
+                return out, None
+        return None, "too-big"
+
+
+# ---------- مۆدالەکان ----------
+
+class SongInfoModal(discord.ui.Modal, title="ناوی گۆرانیبێژ و گۆرانی"):
+    def __init__(self, view):
+        super().__init__()
+        self.sv = view
+        self.artist = discord.ui.TextInput(
+            label="ناوی گۆرانیبێژ", default=view.s.artist, required=False, max_length=60)
+        self.song = discord.ui.TextInput(
+            label="ناوی گۆرانی", default=view.s.title, required=True, max_length=80)
+        self.add_item(self.artist)
+        self.add_item(self.song)
+
+    async def on_submit(self, interaction):
+        s = self.sv.s
+        s.artist = self.artist.value.strip()
+        s.title = self.song.value.strip()
+        s.note = ""
+        await interaction.response.edit_message(embed=song_panel_embed(s), view=self.sv)
+
+
+class SongLyricsModal(discord.ui.Modal, title="تێکستی گۆرانی"):
+    def __init__(self, view):
+        super().__init__()
+        self.sv = view
+        self.text = discord.ui.TextInput(
+            label="تێکست (بەتاڵ = لابردن)", style=discord.TextStyle.paragraph,
+            default=view.s.lyrics or None, required=False, max_length=4000)
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction):
+        s = self.sv.s
+        s.lyrics = self.text.value.strip()
+        s.note = ""
+        await interaction.response.edit_message(embed=song_panel_embed(s), view=self.sv)
+
+
+class SongFontSelect(discord.ui.Select):
+    def __init__(self, current):
+        opts = [discord.SelectOption(label=name, value=k, description=song_style("Marsa", k),
+                                     default=(k == current))
+                for k, (name, _) in SONG_FONTS.items()]
+        super().__init__(placeholder="🔤 فۆنتی ناوی گۆرانیبێژ...", options=opts, row=1)
+
+    async def callback(self, interaction):
+        sv = self.view
+        sv.s.font = self.values[0]
+        for o in self.options:
+            o.default = (o.value == sv.s.font)
+        await interaction.response.edit_message(embed=song_panel_embed(sv.s), view=sv)
+
+
+class SongMentionSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder="👥 مێنشنی کەسانی تر (ئارەزوومەندانە، تا ٥ کەس)...",
+                         min_values=0, max_values=5, row=3)
+
+    async def callback(self, interaction):
+        sv = self.view
+        sv.s.friends = [(u.id, u.display_name, u.mention) for u in self.values if not u.bot]
+        sv.s.note = ""
+        await interaction.response.edit_message(embed=song_panel_embed(sv.s), view=sv)
+
+
+# ---------- پانێل ----------
+
+class SongView(discord.ui.View):
+    def __init__(self, root, session):
+        super().__init__(timeout=14 * 60)
+        self.root = root                      # ئینتەراکشنی /song-texts بۆ نوێکردنەوەی پانێل
+        self.s = session
+        self.author_id = root.user.id
+        self.add_item(SongFontSelect(session.font))
+        self.add_item(SongMentionSelect())
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            try:
+                await interaction.response.send_message(
+                    "ئەمە پانێلی کەسێکی ترە، خۆت /song-texts بکەرەوە 🌷", ephemeral=True, delete_after=8)
+            except Exception:
+                pass
+            return False
+        return True
+
+    async def on_timeout(self):
+        self.s.clear_files()
+        try:
+            await self.root.edit_original_response(
+                embed=discord.Embed(description="⏱ کاتەکە بەسەرچوو، دووبارە /song-texts بکەرەوە", color=SONG_COLOR),
+                view=None)
+        except Exception:
+            pass
+
+    async def _refresh(self):
+        try:
+            await self.root.edit_original_response(embed=song_panel_embed(self.s), view=self)
+        except Exception:
+            pass
+
+    async def _ask_upload(self, interaction, prompt):
+        """چاوەڕێی ناردنی فایل دەکات لەم کەناڵە. (message, attachment) یان None"""
+        await interaction.response.send_message(prompt, ephemeral=True)
+
+        def check(m):
+            return (m.author.id == self.author_id and m.channel.id == interaction.channel_id
+                    and m.attachments)
+        try:
+            m = await bot.wait_for("message", check=check, timeout=SONG_WAIT)
+        except asyncio.TimeoutError:
+            await interaction.edit_original_response(content="⏱ کات بەسەرچوو، دووبارە هەوڵ بدەوە")
+            return None
+        return m, m.attachments[0]
+
+    async def _done(self, interaction, text):
+        self.s.note = text
+        await self._refresh()
+        try:
+            await interaction.edit_original_response(content=text)
+            await asyncio.sleep(4)
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Artist & Song", emoji="🎤", style=discord.ButtonStyle.primary, row=0)
+    async def info_btn(self, interaction, button):
+        await interaction.response.send_modal(SongInfoModal(self))
+
+    @discord.ui.button(label="Lyrics", emoji="📝", style=discord.ButtonStyle.secondary, row=0)
+    async def lyrics_btn(self, interaction, button):
+        await interaction.response.send_modal(SongLyricsModal(self))
+
+    @discord.ui.button(label="Cover", emoji="🖼", style=discord.ButtonStyle.secondary, row=0)
+    async def cover_btn(self, interaction, button):
+        got = await self._ask_upload(
+            interaction, f"🖼 وێنەی گۆرانییەکە لەم کەناڵە بنێرە ({SONG_WAIT} چرکە)")
+        if not got:
+            return
+        m, att = got
+        ct = (att.content_type or "").split(";")[0].lower()
+        if ct not in SONG_IMG_EXT:
+            await self._done(interaction, "❌ تەنها وێنە (PNG / JPG / WEBP / GIF) قبوڵ دەکرێت")
+            return
+        if att.size > SONG_MAX_IMG:
+            await self._done(interaction, f"❌ وێنەکە گەورەترە لە {song_size(SONG_MAX_IMG)}")
+            return
+        data = await att.read()
+        try:
+            await m.delete()                 # نامەی وێنەکەی خۆت دەسڕێتەوە (ئەگەر دەسەڵات هەبوو)
+        except Exception:
+            pass
+        self.s.cover = data
+        self.s.cover_fn = f"cover.{SONG_IMG_EXT[ct]}"
+        await self._done(interaction, "✅ وێنە وەرگیرا")
+
+    @discord.ui.button(label="Audio / Video", emoji="🎧", style=discord.ButtonStyle.secondary, row=0)
+    async def audio_btn(self, interaction, button):
+        got = await self._ask_upload(
+            interaction,
+            f"🎧 فایلی گۆرانی (MP3 / ئۆدیۆ) یان ڤیدیۆ لەم کەناڵە بنێرە ({SONG_WAIT} چرکە)\n"
+            "-# ڤیدیۆ خۆکار دەگۆڕدرێت بۆ MP3")
+        if not got:
+            return
+        m, att = got
+        name = att.filename or "file"
+        ext = os.path.splitext(name)[1].lower()
+        ct = (att.content_type or "").split(";")[0].lower()
+        is_audio = ct.startswith("audio/") or ext in SONG_AUDIO_EXT
+        is_video = ct.startswith("video/") or ext in SONG_VIDEO_EXT
+        if not (is_audio or is_video):
+            await self._done(interaction, "❌ تەنها ئۆدیۆ (MP3...) یان ڤیدیۆ قبوڵ دەکرێت")
+            return
+        if att.size > SONG_MAX_IN:
+            await self._done(interaction, f"❌ فایلەکە گەورەترە لە {song_size(SONG_MAX_IN)}")
+            return
+        limit = interaction.guild.filesize_limit
+        try:
+            await interaction.edit_original_response(content="⏳ فایلەکە وەردەگیرێت...")
+            data = await att.read()
+        except Exception:
+            await self._done(interaction, "❌ نەتوانرا فایلەکە وەربگیرێت")
+            return
+        try:
+            await m.delete()
+        except Exception:
+            pass
+
+        is_mp3 = (ext == ".mp3" or ct == "audio/mpeg") and not is_video
+        if is_mp3 and len(data) <= limit:
+            self.s.audio, self.s.audio_ext = data, ".mp3"
+            await self._done(interaction, "✅ فایلی MP3 وەرگیرا")
+            return
+
+        await interaction.edit_original_response(content="⏳ دەگۆڕدرێت بۆ MP3 ...")
+        out, err = await song_to_mp3(data, name, limit)
+        if out:
+            self.s.audio, self.s.audio_ext = out, ".mp3"
+            await self._done(interaction, "✅ گۆڕدرا بۆ MP3 و وەرگیرا")
+        elif err == "no-ffmpeg":
+            if len(data) > limit:
+                await self._done(interaction, "❌ فایلەکە گەورەترە لە سنووری ئەم سێرڤەرە و ffmpeg نییە بۆ بچووککردنەوەی")
+                return
+            self.s.audio = data
+            self.s.audio_ext = ext if re.fullmatch(r"\.[a-z0-9]{1,5}", ext) else ".mp3"
+            await self._done(interaction, "⚠️ ffmpeg نییە، فایلەکە وەک خۆی دەنێردرێت (نەگۆڕدرا بۆ MP3)")
+        elif err == "too-big":
+            await self._done(interaction, "❌ تەنانەت دوای بچووککردنەوەش گەورەترە لە سنووری سێرڤەر")
+        else:
+            await self._done(interaction, "❌ نەتوانرا بگۆڕدرێت بۆ MP3، فایلەکە دڵنیا بکەرەوە ئۆدیۆی تێدایە")
+
+    @discord.ui.button(label="Preview", emoji="👁", style=discord.ButtonStyle.secondary, row=2)
+    async def preview_btn(self, interaction, button):
+        s = self.s
+        if not s.title:
+            await interaction.response.send_message("سەرەتا ناوی گۆرانی بنووسە 🎤", ephemeral=True, delete_after=8)
+            return
+        extra = ""
+        if s.audio:
+            extra = f"\n🎧 `{song_filename(s)}` ⋅ {song_size(len(s.audio))}"
+        await interaction.response.send_message(
+            content=f"👁 Preview{extra}",
+            embeds=song_build(s, interaction.user)[:1],
+            files=song_files(s, with_audio=False), ephemeral=True)
+
+    @discord.ui.button(label="Send", emoji="📤", style=discord.ButtonStyle.success, row=2)
+    async def send_btn(self, interaction, button):
+        s = self.s
+        if not s.title:
+            await interaction.response.send_message("سەرەتا ناوی گۆرانی بنووسە 🎤", ephemeral=True, delete_after=8)
+            return
+        if not (s.lyrics or s.audio or s.cover):
+            await interaction.response.send_message(
+                "لانیکەم تێکست، وێنە یان فایلێک زیاد بکە 🌷", ephemeral=True, delete_after=8)
+            return
+        wait = SONG_COOLDOWN - (time.time() - _song_last.get(interaction.user.id, 0))
+        if wait > 0:
+            await interaction.response.send_message(
+                f"چاوەڕێ بکە {int(wait) + 1} چرکە 🌷", ephemeral=True, delete_after=8)
+            return
+        limit = interaction.guild.filesize_limit
+        if len(s.cover or b"") + len(s.audio or b"") > limit:
+            await interaction.response.send_message(
+                f"❌ کۆی فایلەکان گەورەترە لە سنووری سێرڤەر ({song_size(limit)})", ephemeral=True, delete_after=10)
+            return
+
+        _song_last[interaction.user.id] = time.time()
+        await interaction.response.edit_message(
+            embed=discord.Embed(description="📤 دەنێردرێت...", color=SONG_COLOR), view=None)
+        try:
+            embeds = song_build(s, interaction.user)
+            nomention = discord.AllowedMentions.none()      # مێنشن تەنها لەناو ئیمبێد دەردەکەوێت، بێ نوتیفیکەیشن
+            await interaction.channel.send(
+                embed=embeds[0], files=song_files(s, with_audio=True), allowed_mentions=nomention)
+            for extra in embeds[1:]:
+                await interaction.channel.send(embed=extra, allowed_mentions=nomention)
+            result = discord.Embed(description="✅ ناردرا ♡", color=SONG_COLOR)
+        except discord.Forbidden:
+            _song_last.pop(interaction.user.id, None)
+            result = discord.Embed(
+                description="❌ بۆتەکە دەسەڵاتی Send Messages / Embed Links / Attach Files لەم کەناڵە نییە",
+                color=discord.Color.red())
+        except Exception as ex:
+            _song_last.pop(interaction.user.id, None)
+            print(f"song send error: {ex}", flush=True)
+            result = discord.Embed(description="❌ هەڵەیەک ڕوویدا، دووبارە هەوڵ بدەوە", color=discord.Color.red())
+        s.clear_files()
+        self.stop()
+        try:
+            await interaction.edit_original_response(embed=result, view=None)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Cancel", emoji="✖️", style=discord.ButtonStyle.danger, row=2)
+    async def cancel_btn(self, interaction, button):
+        self.s.clear_files()
+        self.stop()
+        await interaction.response.edit_message(
+            embed=discord.Embed(description="✖️ هەڵوەشایەوە", color=SONG_COLOR), view=None)
+
+
+@bot.tree.command(name="song-texts", description="تێکست، وێنە و فایلی گۆرانی بە شێوازێکی جوان بنێرە")
+@app_commands.guild_only()
+async def song_texts_cmd(interaction: discord.Interaction):
+    s = SongSession()
+    await interaction.response.send_message(
+        embed=song_panel_embed(s), view=SongView(interaction, s), ephemeral=True)
+
+
+
+# =========================================================
+# 42. /help  +  BIO ی بۆتەکە
+# =========================================================
+
+HELP_COLOR = discord.Color.from_rgb(250, 205, 235)
+
+BOT_BIO = (
+    "🌸 بۆتی بەڕێوەبردن و چالاکی سێرڤەر\n"
+    "Mute ⋆ Bfra ⋆ Safika ⋆ لۆگ ⋆ پاراستن ⋆ Auto React ⋆ XP ⋆ Ship ⋆ Song Texts و زۆر شتی تر\n"
+    "📖 بۆ ڕوونکردنەوەی هەموو کۆمانەکان و بەکارهێنانیان بنووسە: /help"
+)[:400]
+
+HELP_SECTIONS = {
+    "home": ("📖", "سەرەتا"),
+    "mod": ("🛡", "مۆدەراسیۆن"),
+    "setup": ("⚙️", "ڕێکخستنی سێرڤەر"),
+    "roles": ("👑", "دەسەڵات و ڕۆڵەکان"),
+    "protect": ("🔐", "پاراستن و چاودێری"),
+    "fun": ("🎉", "چالاکی و خۆشی"),
+    "owner": ("🧰", "تایبەت"),
+}
+
+HELP_TEXT = {
+    "mod": (
+        "**ئەم کۆمانانە بێ `/` ـن، تەنها لە چات بیاننووسە** (تاگی کەسەکە بکە یان ڕیپلەی نامەکەی بکە)\n\n"
+        "🔇 **`mute @کەس`**\n└ ئەندام Mute دەکات: ڕۆڵی Muted دەدرێت و نامەکانی دەسڕدرێنەوە.\n"
+        "🔊 **`unmute @کەس`**\n└ Mute لادەبات.\n"
+        "🔨 **`bfra @کەس`**\n└ ئەندام Ban دەکات (دەردەچێت لە سێرڤەر).\n"
+        "♻️ **`unban ئایدی`**\n└ Ban لادەبات، ئایدی ئەندامەکە بنووسە، وەک `unban 123456789012345678`.\n"
+        "🧹 **`safika 10`**\n└ ژمارەیەک نامە دەسڕێتەوە لە کەناڵەکە (تا 1000).\n"
+        "🔒 **`lock`** / 🔓 **`unlock`**\n└ کەناڵەکە دادەخات یان دەیکاتەوە بۆ نووسین (پێویستی بە Manage Channels هەیە).\n\n"
+        "-# کێ دەتوانێت: ڕۆڵی Mute بە `/rolemute` ، Bfra بە `/roleban` ، Safika بە `/rolesafika` دیاری دەکرێت."
+    ),
+    "setup": (
+        "**تەنها Administrator / دیڤیلۆپەر**\n\n"
+        "📜 **`/setlog`**\n└ کەناڵی هەر جۆرە لۆگێک دیاری دەکات (Chat، Voice، Ban، Role، Channel ...).\n"
+        "📚 **`/setlogall`**\n└ هەموو لۆگەکان دەخاتە یەک کەناڵەوە.\n"
+        "🔇 **`/setmuterole`**\n└ ئەو ڕۆڵە دیاری دەکات کە لە کاتی Mute دەدرێت.\n"
+        "🎁 **`/autorole`**\n└ چەند ڕۆڵێک کە خۆکار دەدرێن بە ئەندامی نوێ.\n"
+        "👋 **`/welcome`**\n└ کەناڵەکانی بەخێرهاتن و نامەی بەخێرهاتن.\n"
+        "🔢 **`/counting`**\n└ کەناڵی ژماردن (1، 2، 3 ...) و یاساکانی.\n"
+        "🗂 **`/config`**\n└ هەموو ڕێکخستنەکانی ئەم سێرڤەرە پیشان دەدات."
+    ),
+    "roles": (
+        "**کێ بتوانێت چی بکات**\n\n"
+        "🧑‍💻 **`/setdev`**\n└ ڕۆڵی دیڤیلۆپەر (تەنها خاوەنی سێرڤەر).\n"
+        "🔇 **`/rolemute`** ⋅ 🔨 **`/roleban`** ⋅ 🧹 **`/rolesafika`**\n└ ئەو ڕۆڵانەی دەتوانن Mute / Bfra / Safika بکەن.\n"
+        "⭐ **`/rolestaff`**\n└ ئەو ڕۆڵانەی دەتوانن `/staff` بەکاربهێنن.\n"
+        "🛠 **`/setstaff`**\n└ ڕۆڵەکانی Lady Staff و Boy Staff دیاری دەکات.\n"
+        "🎖 **`/staff`**\n└ ڕۆڵی ستاف دەدات بە ئەندام (Lady / Boy Staff).\n"
+        "🎨 **`/rangi-role`**\n└ ڕەنگی ڕۆڵ دەگۆڕێت، کۆدی ڕەنگ بنووسە وەک `#FF0000`.\n"
+        "✅ **`/regadan-ranggorin`**\n└ ڕۆڵ و کەسانی ڕێگەپێدراو بۆ گۆڕینی ڕەنگ.\n"
+        "🚫 **`/regri`**\n└ قەدەغەکردن یان ڕێگەپێدانی گۆڕینی ڕەنگ بۆ ئەندامێک.\n"
+        "🔑 **`/regri-roles`**\n└ ئەو ڕۆڵانەی دەتوانن `/regri` بەکاربهێنن."
+    ),
+    "protect": (
+        "🛡 **`/security`**\n└ سیستمی پاراستن: Anti-Spam و Anti-Nuke (دژی سپام و تێکدانی سێرڤەر)، سزا، وایت لیست و لۆگ.\n\n"
+        "🔗 **`/blocklink`**\n└ کەناڵەکانێک دیاری دەکەیت کە لینکی تێدا قەدەغەیە (نامەکە دەسڕدرێتەوە).\n\n"
+        "📢 **`/reklam`**\n└ کاتێک کەسێک وشەی Reklam دەنووسێت، بۆتەکە نامەی جوانی ڕێکلام دەنێرێت و ڕۆڵەکانی دیاریکراو تاگ دەکات. "
+        "بەشی **Partner**یش هەیە: لە کەناڵی پارتنەر تەنها نامەی لینکی سێرڤەر ڕێگەپێدراوە.\n\n"
+        "😀 **`/autoreact`**\n└ ڕیاکتی خۆکار لە کەناڵە دیاریکراوەکان: هەر نامەیەک (دەق، وێنە، ڤیدیۆ، نامەی بۆت و تێکستی گۆرانی) ئیمۆجییەکان وەرگرێت.\n"
+        "   ⋅ کەناڵی نوێ هەڵبژێریت زیاد دەبێت بۆ پێشووەکان\n"
+        "   ⋅ لیستی لابردن بۆ لابردنی یەک کەناڵ\n"
+        "   ⋅ **Mode**: هەموو / تەنها وێنە / تەنها ڤیدیۆ / تەنها دەق\n"
+        "   ⋅ **Pick by Reacting**: ئیمۆجی وەک ڕیاکت دابنێ و بۆتەکە خۆی زیادیان بکات"
+    ),
+    "fun": (
+        "✨ **`/xp`**\n└ تۆپی XP: چات و ڤۆیس، ڕۆژانە / هەفتانە / مانگانە / ساڵانە، خۆکار نوێ دەبێتەوە.\n"
+        "⚙️ **`/setxp`**\n└ دیاری دەکات کێ و لە کوێ دەتوانێت `/xp` بەکاربهێنێت.\n\n"
+        "💞 **`ship @کەس`**\n└ ڕێژەی خۆشەویستی نێوان تۆ و ئەو کەسە (هەموو ڕۆژێک نوێ دەبێتەوە).\n"
+        "💋 **`kiss`** / `mach` ⋅ 🫶 **`hug`** / `bawesh` ⋅ 🎀 **`pat`** / `naz` + `@کەس`\n└ ماچ، باوەش و نازدان.\n"
+        "🛠 **`/setlove`**\n└ کەناڵەکان و نووسینی ship / kiss / hug ڕێکدەخات.\n\n"
+        "🎶 **`/song-texts`** (هەموو کەسێک)\n└ تێکست، وێنە و فایلی گۆرانی بە شێوازێکی جوان دەنێرێت:\n"
+        "   ⋅ 🎤 ناوی گۆرانیبێژ و گۆرانی ⋅ 📝 تێکست ⋅ 🖼 وێنە ⋅ 🎧 فایل (ڤیدیۆ خۆکار دەبێتە MP3)\n"
+        "   ⋅ 🔤 فۆنتی ناوی گۆرانیبێژ ⋅ 👁 Preview ⋅ 📤 Send"
+    ),
+    "owner": (
+        "🧬 **`/create_channels`**\n└ **تەنها خاوەنی بۆت.** سێرڤەرێک کۆپی دەکات (ڕۆڵ، کەناڵ، Permission، ئیمۆجی و ڕێکخستنەکانی بۆت) و لە سێرڤەرێکی تر دایدەنێتەوە (Paste).\n"
+        "-# سێرڤەری سەرچاوە دەپارێزرێت و هیچ شتێکی تێدا ناسڕدرێتەوە."
+    ),
+}
+
+
+HELP_SHORT = {
+    "mod": "mute ⋅ unmute ⋅ bfra ⋅ unban ⋅ safika ⋅ lock ⋅ unlock",
+    "setup": "/setlog ⋅ /setlogall ⋅ /setmuterole ⋅ /autorole ⋅ /welcome ⋅ /counting ⋅ /config",
+    "roles": "/setdev ⋅ /rolemute ⋅ /roleban ⋅ /rolesafika ⋅ /rolestaff ⋅ /staff ⋅ /rangi-role ⋅ /regri",
+    "protect": "/security ⋅ /blocklink ⋅ /reklam ⋅ /autoreact",
+    "fun": "/xp ⋅ /setxp ⋅ ship ⋅ kiss ⋅ hug ⋅ pat ⋅ /setlove ⋅ /song-texts",
+    "owner": "/create_channels",
+}
+
+
+def help_embed(key):
+    icon, name = HELP_SECTIONS[key]
+    if key == "home":
+        e = discord.Embed(
+            title="📖 یارمەتی بۆتەکە",
+            description="لە لیستی خوارەوە بەشێک هەڵبژێرە، هەموو کۆمانەکان و بۆچوونیان و چۆنیەتی بەکارهێنانیان پیشان دەدرێت 🌸",
+            color=HELP_COLOR)
+        for k, (ic, nm) in HELP_SECTIONS.items():
+            if k != "home":
+                e.add_field(name=f"{ic} {nm}", value=HELP_SHORT[k], inline=False)
+        e.set_footer(text="کۆمانی بێ / (وەک mute) تەنها بە نووسین لە چات کار دەکات")
+        return e
+    return discord.Embed(title=f"{icon} {name}", description=HELP_TEXT[key], color=HELP_COLOR)
+
+
+class HelpSelect(discord.ui.Select):
+    def __init__(self, current):
+        opts = [discord.SelectOption(label=nm, value=k, emoji=ic, default=(k == current))
+                for k, (ic, nm) in HELP_SECTIONS.items()]
+        super().__init__(placeholder="بەشێک هەڵبژێرە...", options=opts, min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        await interaction.response.edit_message(
+            embed=help_embed(self.values[0]), view=HelpView(interaction.user.id, self.values[0]))
+
+
+class HelpView(discord.ui.View):
+    def __init__(self, author_id, current="home"):
+        super().__init__(timeout=600)
+        self.author_id = author_id
+        self.add_item(HelpSelect(current))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "ئەمە پانێلی کەسێکی ترە، خۆت `/help` بنووسە 🌷", ephemeral=True)
+            return False
+        return True
+
+
+@bot.tree.command(name="help", description="ڕوونکردنەوەی هەموو کۆمان و بەشەکانی بۆتەکە")
+async def help_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=help_embed("home"), view=HelpView(interaction.user.id), ephemeral=True)
+
+
+_bio_done = False
+
+
+async def set_bot_bio():
+    """بیۆی بۆتەکە (About Me) نوێ دەکاتەوە، تێیدا /help ی نووسراوە"""
+    global _bio_done
+    if _bio_done:
+        return
+    _bio_done = True
+    try:
+        from discord.http import Route
+        await bot.http.request(Route("PATCH", "/applications/@me"), json={"description": BOT_BIO})
+        print("Bot bio updated", flush=True)
+    except Exception as ex:
+        print(f"bio update failed: {ex}", flush=True)
+
+
+bot.add_listener(set_bot_bio, "on_ready")
+
+
+# =========================================================
+# 43. TEXT TO VOICE (ElevenLabs)  —  !! دەقەکەت
+# =========================================================
+# - تەنها ئایدی خۆت (TTS_OWNER_ID) دەتوانێت بەکاری بهێنێت
+# - بنووسە:  !! nmwn bam shewaya ba piti englizi qsa bkam
+#   بۆتەکە نامەکەت دەسڕێتەوە و دەنگی کچێکی ناسک دەنێرێت (فایلی MP3)
+# - API Key هەرگیز لەناو کۆدەکەدا نانووسرێت، لە Railway > Variables:
+#       ELEVENLABS_API_KEY   = کلیلەکەت (پێویستە)
+#       ELEVENLABS_VOICE_ID  = ئایدی دەنگ (ئارەزوومەندانە)
+#       ELEVENLABS_MODEL     = مۆدێل (ئارەزوومەندانە، دیفەڵت eleven_v4)
+#       ELEVENLABS_LANG      = کۆدی زمان (ئارەزوومەندانە، بەتاڵ = خۆکار)
+# - هیچ پاکێجێکی نوێ پێویست نییە (aiohttp لەگەڵ discord.py دێت)
+
+import aiohttp as _aiohttp
+
+TTS_OWNER_ID = 1130455970494025860          # تەنها ئەم ئەکاونتە
+TTS_TRIGGER = "!!"
+TTS_MAX_CHARS = 2500
+TTS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID") or "EXAVITQu4vr4xnSDxMaL"   # Sarah: دەنگی کچێکی ناسک و گەنج
+TTS_MODEL = os.getenv("ELEVENLABS_MODEL") or "eleven_v4"
+TTS_LANG = os.getenv("ELEVENLABS_LANG") or None
+_tts_busy = False
+
+
+async def tts_generate(text):
+    """(mp3 bytes, None) یان (None, هۆکاری هەڵە)"""
+    key = os.getenv("ELEVENLABS_API_KEY")
+    if not key:
+        return None, "ELEVENLABS_API_KEY لە Railway Variables دانەنراوە."
+
+    models = []
+    for m in (TTS_MODEL, "eleven_v3", "eleven_multilingual_v2"):
+        if m not in models:
+            models.append(m)
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{TTS_VOICE_ID}"
+    last_err = "هەڵەی نەزانراو"
+    timeout = _aiohttp.ClientTimeout(total=90)
+    async with _aiohttp.ClientSession(timeout=timeout) as http:
+        for model in models:
+            body = {
+                "text": text,
+                "model_id": model,
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            }
+            if TTS_LANG:
+                body["language_code"] = TTS_LANG
+            try:
+                async with http.post(
+                    url, params={"output_format": "mp3_44100_128"},
+                    headers={"xi-api-key": key, "Content-Type": "application/json",
+                             "Accept": "audio/mpeg"},
+                    json=body,
+                ) as r:
+                    if r.status == 200:
+                        return await r.read(), None
+                    detail = (await r.text())[:300]
+                    if r.status == 401:
+                        return None, "API Key هەڵەیە یان لابراوە (401)."
+                    if r.status == 402 or "quota" in detail.lower():
+                        return None, "بالانسی ElevenLabs تەواو بووە (quota)."
+                    if r.status == 429:
+                        return None, "زۆر داواکاری نێردرا، کەمێک چاوەڕێ بکە (429)."
+                    last_err = f"{model}: {r.status} {detail}"
+                    print(f"tts error {last_err}", flush=True)
+            except asyncio.TimeoutError:
+                last_err = "کاتەکە بەسەرچوو (timeout)."
+            except Exception as ex:
+                last_err = f"{model}: {ex}"
+                print(f"tts exception {last_err}", flush=True)
+    return None, last_err
+
+
+async def tts_on_message(message):
+    global _tts_busy
+    if message.author.bot or message.guild is None:
+        return
+    if message.author.id != TTS_OWNER_ID:
+        return
+    content = (message.content or "").strip()
+    if not content.startswith(TTS_TRIGGER):
+        return
+
+    text = content[len(TTS_TRIGGER):].strip()
+    if not text:
+        return
+    if len(text) > TTS_MAX_CHARS:
+        await message.channel.send(
+            f"❌ دەقەکە زۆر درێژە ({len(text)}). زۆرترین `{TTS_MAX_CHARS}` پیت.", delete_after=8)
+        return
+
+    if _tts_busy:
+        await message.channel.send("⏳ چاوەڕێ بکە، دەنگێکی تر دروست دەکرێت.", delete_after=5)
+        return
+    _tts_busy = True
+    try:
+        async with message.channel.typing():
+            audio, err = await tts_generate(text)
+
+        if not audio:
+            # نامەکە ناسڕدرێتەوە تا دەقەکەت نەفەوتێت
+            await message.channel.send(f"❌ {err}", delete_after=12)
+            return
+
+        # ئەگەر وەڵامی نامەی کەسێکت دابێتەوە، دەنگەکەش وەڵامی هەمان نامە دەبێت
+        ref = None
+        if message.reference and message.reference.message_id:
+            ref = discord.MessageReference(
+                message_id=message.reference.message_id,
+                channel_id=message.channel.id, fail_if_not_exists=False)
+
+        file = discord.File(_io.BytesIO(audio), filename="voice.mp3")
+        try:
+            await message.channel.send(
+                file=file, reference=ref, mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none())
+        except discord.Forbidden:
+            await message.channel.send(
+                "❌ بۆتەکە دەسەڵاتی Attach Files ی نییە لەم کەناڵە.", delete_after=10)
+            return
+
+        try:
+            await message.delete()
+        except Exception:
+            pass   # بۆتەکە پێویستی بە Manage Messages ە
+    except Exception as ex:
+        print(f"tts handler error: {ex}", flush=True)
+        try:
+            await message.channel.send(f"❌ هەڵە: {ex}", delete_after=10)
+        except Exception:
+            pass
+    finally:
+        _tts_busy = False
+
+
+bot.add_listener(tts_on_message, "on_message")
+
+
+# =========================================================
+# 29f. DATA BACKUP / RESTORE  (/get-data  &  /upload-data)
+# =========================================================
+# /get-data     → هەموو داتای بۆتەکە (guild_config + xp_data + server_templates) دەکاتە یەک ZIP و بۆت دەنێرێت
+# /upload-data  → ZIP ەکە وەردەگرێت و لەگەڵ داتای ئێستا Tێکەڵی دەکات (هیچ شتێک ناسڕێتەوە)
+#   - هەر سێرڤەرەو داتای خۆی (بەپێی ئایدی سێرڤەر) دەگەڕێتەوە، تێکەڵ نابن
+#   - ئەگەر server بنووسیت (ئایدی سێرڤەر) تەنها داتای ئەو سێرڤەرە دەگەڕێتەوە
+#   - پێش تێکەڵکردن backup ی داتای ئێستا هەڵدەگیرێت (فۆڵدەری backups)
+# تەنها خاوەنی بۆت (CC_OWNER_ID) بەکاری دەهێنێت
+
+import zipfile as _zipfile
+
+DATA_DIR = os.path.dirname(CONFIG_FILE) or "."
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+DATA_MAX_ZIP = 25 * 1024 * 1024          # گەورەترین ZIP ی ڕێگەپێدراو بۆ Upload
+DATA_MAX_UNZIPPED = 300 * 1024 * 1024    # دژی zip-bomb
+DATA_KEEP_BACKUPS = 5
+
+
+def _dt_build_zip(include_templates=True, only_guild=None):
+    """ZIP دروست دەکات و bytes دەگەڕێنێتەوە"""
+    save_config()
+    xp_save_now()
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for path, arc in ((CONFIG_FILE, "guild_config.json"), (XP_FILE, "xp_data.json")):
+            if os.path.isfile(path):
+                z.write(path, arc)
+        if include_templates and os.path.isdir(CC_DIR):
+            for fn in sorted(os.listdir(CC_DIR)):
+                full = os.path.join(CC_DIR, fn)
+                if os.path.isfile(full) and fn.endswith(".json"):
+                    z.write(full, "server_templates/" + fn)
+        z.writestr("manifest.json", json.dumps({
+            "app": "gorani-bot-data", "version": 1,
+            "created": _dt.datetime.utcnow().isoformat() + "Z",
+            "templates": bool(include_templates),
+        }))
+    return buf.getvalue()
+
+
+def _dt_merge(cur, inc, num_max=False):
+    """تێکەڵکردنی قووڵ، cur لە شوێنی خۆی نوێ دەکرێتەوە.
+    dict → recursive | list → union (بێ دووبارەبوونەوە) | ژمارە → num_max ? max : inc | تر → inc
+    inc ی بەتاڵ (None / "" / [] / {}) هەرگیز شتێکی پڕ ناگۆڕێت."""
+    if isinstance(cur, dict) and isinstance(inc, dict):
+        for k, v in inc.items():
+            if k in cur:
+                cur[k] = _dt_merge(cur[k], v, num_max)
+            else:
+                cur[k] = v
+        return cur
+    if isinstance(cur, list) and isinstance(inc, list):
+        for item in inc:
+            if item not in cur:
+                cur.append(item)
+        return cur
+    if inc is None or inc == "" or inc == [] or inc == {}:
+        return cur if cur not in (None, "", [], {}) else inc
+    if (num_max and isinstance(cur, (int, float)) and isinstance(inc, (int, float))
+            and not isinstance(cur, bool) and not isinstance(inc, bool)):
+        return max(cur, inc)
+    return inc
+
+
+def _dt_read_zip(raw):
+    """ZIP ەکە دەخوێنێتەوە و پشکنینی ئەمنی دەکات. دەگەڕێتەوە: (config, xp, templates{name: bytes})"""
+    z = _zipfile.ZipFile(_io.BytesIO(raw))
+    infos = z.infolist()
+    if sum(i.file_size for i in infos) > DATA_MAX_UNZIPPED:
+        raise ValueError("فایلەکە زۆر گەورەیە (zip-bomb؟)")
+    cfg_in, xp_in, tpls = {}, {}, {}
+    found = False
+    for i in infos:
+        name = i.filename
+        if name.endswith("/") or name == "manifest.json":
+            continue
+        if name == "guild_config.json":
+            cfg_in = json.loads(z.read(i).decode("utf-8")); found = True
+        elif name == "xp_data.json":
+            xp_in = json.loads(z.read(i).decode("utf-8")); found = True
+        elif name.startswith("server_templates/"):
+            base = name[len("server_templates/"):]
+            if "/" in base or "\\" in base or ".." in base or not base.endswith(".json"):
+                raise ValueError(f"ناوی نادروست لە ZIP: {name}")
+            tpls[base] = z.read(i)
+        else:
+            raise ValueError(f"فایلی نەناسراو لە ZIP: {name}")
+    if not found:
+        raise ValueError("guild_config.json یان xp_data.json لەناو ZIP نییە")
+    if not isinstance(cfg_in, dict) or not isinstance(xp_in, dict):
+        raise ValueError("ناوەڕۆکی JSON نادروستە")
+    return cfg_in, xp_in, tpls
+
+
+def _dt_backup_now():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(BACKUP_DIR, f"pre-upload-{stamp}.zip")
+    with open(path, "wb") as f:
+        f.write(_dt_build_zip(include_templates=True))
+    olds = sorted(fn for fn in os.listdir(BACKUP_DIR) if fn.startswith("pre-upload-"))
+    for fn in olds[:-DATA_KEEP_BACKUPS]:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, fn))
+        except OSError:
+            pass
+    return path
+
+
+def _dt_apply(cfg_in, xp_in, tpls, only_guild=None):
+    """تێکەڵکردن لە مەمۆری (بێ await، بۆیە race نابێت). دەگەڕێتەوە ئامار."""
+    stats = {"guilds": set(), "boards": 0, "templates": 0}
+    gid = str(only_guild) if only_guild else None
+
+    # --- config ---
+    for g, v in cfg_in.items():
+        if gid and g != gid:
+            continue
+        if not isinstance(v, dict):
+            continue
+        cur = config.setdefault(g, {})
+        _dt_merge(cur, v)
+        stats["guilds"].add(g)
+
+    # --- xp_data ---
+    for key, val in xp_in.items():
+        if key == "users" and isinstance(val, dict):
+            for g, v in val.items():
+                if gid and g != gid:
+                    continue
+                _dt_merge(xp_db["users"].setdefault(g, {}), v, num_max=True)
+                stats["guilds"].add(g)
+        elif key == "love" and isinstance(val, dict):
+            for g, v in val.items():
+                if gid and g != gid:
+                    continue
+                _dt_merge(xp_db.setdefault("love", {}).setdefault(g, {}), v, num_max=True)
+                stats["guilds"].add(g)
+        elif key == "boards" and isinstance(val, list):
+            for b in val:
+                if not isinstance(b, dict):
+                    continue
+                if gid and str(b.get("g")) != gid:
+                    continue
+                same = any(str(x.get("g")) == str(b.get("g")) and str(x.get("m")) == str(b.get("m"))
+                           for x in xp_db["boards"])
+                if not same:
+                    xp_db["boards"].append(b)
+                    stats["boards"] += 1
+        elif not gid:
+            # کلیلی تر (بێ ئایدی سێرڤەر) تەنها لە Upload ی تەواو
+            if key in xp_db:
+                xp_db[key] = _dt_merge(xp_db[key], val, num_max=True)
+            else:
+                xp_db[key] = val
+
+    # --- templates (تەنها لە Upload ی تەواو) ---
+    if not gid and tpls:
+        os.makedirs(CC_DIR, exist_ok=True)
+        for fn, data in tpls.items():
+            path = os.path.join(CC_DIR, fn)
+            if fn == "sources.json":
+                try:
+                    merged = cc_sources() | {int(x) for x in json.loads(data.decode("utf-8"))}
+                    data = json.dumps(sorted(merged)).encode("utf-8")
+                except Exception:
+                    continue
+            with open(path + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(path + ".tmp", path)
+            stats["templates"] += 1
+
+    save_config()
+    xp_save_now()
+    return stats
+
+
+@bot.tree.command(name="get-data", description="هەموو داتای بۆتەکە دابەزێنە وەک فایل (تەنها خاوەنی بۆت)")
+@app_commands.describe(templates="تێمپلەیتەکانی کۆپی سێرڤەریش لەگەڵیدا بێت؟ (بنەڕەت: بەڵێ)")
+async def get_data_cmd(interaction: discord.Interaction, templates: bool = True):
+    if interaction.user.id != CC_OWNER_ID:
+        await deny_interaction(interaction)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        limit = interaction.guild.filesize_limit if interaction.guild else 10 * 1024 * 1024
+        limit = min(limit, 25 * 1024 * 1024) - 64 * 1024
+        note = ""
+        raw = await asyncio.to_thread(_dt_build_zip, templates)
+        if len(raw) > limit and templates:
+            raw = await asyncio.to_thread(_dt_build_zip, False)
+            note = "\n⚠️ تێمپلەیتەکان زۆر گەورە بوون بۆیە لەگەڵیدا نین. فۆڵدەری `server_templates` جیا بگوازەرەوە."
+        if len(raw) > limit:
+            await interaction.followup.send(
+                f"❌ فایلەکە {len(raw)/1048576:.1f}MB یە و لە سنووری Discord گەورەترە.", ephemeral=True)
+            return
+        stamp = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M")
+        await interaction.followup.send(
+            f"✅ داتای بۆتەکە ئامادەیە ({len(raw)/1024:.0f}KB)\n"
+            f"سێرڤەرەکان: **{len(config)}**  |  بۆردی XP: **{len(xp_db.get('boards', []))}**{note}\n"
+            f"لە بۆتی نوێ بە `/upload-data` بینێرەوە.",
+            file=discord.File(_io.BytesIO(raw), filename=f"bot-data-{stamp}.zip"),
+            ephemeral=True,
+        )
+    except Exception as ex:
+        print(f"get-data error: {ex}", flush=True)
+        await interaction.followup.send(f"❌ هەڵە: {ex}", ephemeral=True)
+
+
+@bot.tree.command(name="upload-data", description="داتای پێشوو بگەڕێنەوە و لەگەڵ داتای ئێستا تێکەڵی بکە (تەنها خاوەنی بۆت)")
+@app_commands.describe(file="فایلی ZIP ی /get-data",
+                       server="ئایدی سێرڤەر: تەنها داتای ئەو سێرڤەرە بگەڕێنەوە (ئارەزووومەندانە)")
+async def upload_data_cmd(interaction: discord.Interaction, file: discord.Attachment, server: str = None):
+    if interaction.user.id != CC_OWNER_ID:
+        await deny_interaction(interaction)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        only = None
+        if server:
+            server = server.strip()
+            if not server.isdigit():
+                await interaction.followup.send("❌ ئایدی سێرڤەر دەبێت ژمارە بێت.", ephemeral=True)
+                return
+            only = server
+        if not file.filename.lower().endswith(".zip"):
+            await interaction.followup.send("❌ تەنها فایلی `.zip` ی /get-data.", ephemeral=True)
+            return
+        if file.size > DATA_MAX_ZIP:
+            await interaction.followup.send("❌ فایلەکە زۆر گەورەیە.", ephemeral=True)
+            return
+        raw = await file.read()
+        cfg_in, xp_in, tpls = _dt_read_zip(raw)
+        backup = await asyncio.to_thread(_dt_backup_now)
+        stats = _dt_apply(cfg_in, xp_in, tpls, only)
+        if only and only not in stats["guilds"]:
+            msg = f"⚠️ لەناو فایلەکە هیچ داتایەک بۆ سێرڤەری `{only}` نەدۆزرایەوە."
+        else:
+            msg = (f"✅ داتا تێکەڵ کرا\n"
+                   f"سێرڤەر: **{len(stats['guilds'])}**  |  بۆردی نوێ: **{stats['boards']}**  |  "
+                   f"تێمپلەیت: **{stats['templates']}**\n"
+                   f"🗂 backup ی داتای پێشوو: `{os.path.basename(backup)}`")
+        await interaction.followup.send(msg, ephemeral=True)
+    except (_zipfile.BadZipFile, ValueError, json.JSONDecodeError) as ex:
+        await interaction.followup.send(f"❌ فایلەکە دروست نییە: {ex}", ephemeral=True)
+    except Exception as ex:
+        print(f"upload-data error: {ex}", flush=True)
+        await interaction.followup.send(f"❌ هەڵە: {ex}", ephemeral=True)
 
 
 # =========================================================
