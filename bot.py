@@ -19,7 +19,13 @@ intents.message_content = True
 intents.members = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="", intents=intents, case_insensitive=True)
+bot = commands.Bot(
+    command_prefix="",
+    intents=intents,
+    case_insensitive=True,
+    status=discord.Status.dnd,
+    activity=discord.Activity(type=discord.ActivityType.listening, name="!help | /help"),
+)
 
 # =========================================================
 # 2. PER-SERVER CONFIG (saved in guild_config.json)
@@ -5974,7 +5980,7 @@ async def song_texts_cmd(interaction: discord.Interaction):
 HELP_COLOR = discord.Color.from_rgb(250, 205, 235)
 
 BOT_BIO = (
-    "🌸 Server Management & Activity Bot\n"
+    "Server Management & Activity Bot\n"
     "\n"
     "🛡 **Moderation:** Mute ⋆ Bfra ⋆ Safika\n"
     "🔐 **Security:** Anti-Nuke ⋆ Logs\n"
