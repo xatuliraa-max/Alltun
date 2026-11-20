@@ -6129,7 +6129,7 @@ async def set_bot_bio():
     try:
         from discord.http import Route
         await bot.http.request(Route("PATCH", "/applications/@me"), json={"description": BOT_BIO})
-        print("Bot bio updated", flush=True)
+        print(f"Bot bio updated [build v3] first line: {BOT_BIO.splitlines()[0]}", flush=True)
     except Exception as ex:
         print(f"bio update failed: {ex}", flush=True)
 
@@ -6144,6 +6144,7 @@ async def set_bot_presence():
             status=discord.Status.dnd,
             activity=discord.Activity(type=discord.ActivityType.listening, name="!help | /help"),
         )
+        print("Bot presence set to DND [build v3]", flush=True)
     except Exception as ex:
         print(f"presence update failed: {ex}", flush=True)
 
