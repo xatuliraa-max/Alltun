@@ -5974,9 +5974,14 @@ async def song_texts_cmd(interaction: discord.Interaction):
 HELP_COLOR = discord.Color.from_rgb(250, 205, 235)
 
 BOT_BIO = (
-    "🌸 بۆتی بەڕێوەبردن و چالاکی سێرڤەر\n"
-    "Mute ⋆ Bfra ⋆ Safika ⋆ لۆگ ⋆ پاراستن ⋆ Auto React ⋆ XP ⋆ Ship ⋆ Song Texts و زۆر شتی تر\n"
-    "📖 بۆ ڕوونکردنەوەی هەموو کۆمانەکان و بەکارهێنانیان بنووسە: /help"
+    "🌸 Server Management & Activity Bot\n"
+    "\n"
+    "🛡 **Moderation:** Mute ⋆ Bfra ⋆ Safika\n"
+    "🔐 **Security:** Anti-Nuke ⋆ Logs\n"
+    "✨ **Fun:** XP ⋆ Ship ⋆ Song Texts\n"
+    "📖 **Help:** /help\n"
+    "\n"
+    "👑 **Developer:** 𝗱𝘂𝗱𝘂𝘂"
 )[:400]
 
 HELP_SECTIONS = {
@@ -6124,6 +6129,20 @@ async def set_bot_bio():
 
 
 bot.add_listener(set_bot_bio, "on_ready")
+
+
+async def set_bot_presence():
+    """بۆتەکە دەخاتە Do Not Disturb (سووری) لەگەڵ Listening to"""
+    try:
+        await bot.change_presence(
+            status=discord.Status.dnd,
+            activity=discord.Activity(type=discord.ActivityType.listening, name="!help | /help"),
+        )
+    except Exception as ex:
+        print(f"presence update failed: {ex}", flush=True)
+
+
+bot.add_listener(set_bot_presence, "on_ready")
 
 
 # =========================================================
