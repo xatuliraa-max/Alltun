@@ -2786,51 +2786,19 @@ def rk_link_messages(parts):
 
 
 async def rk_send_link(ch, parts):
-    """Send the Link message as ONE message: text, GIF, text in exactly the order written.
-    Uses Discord's newer layout messages (discord.py 2.6+); older versions fall back to 2 messages."""
-    no_mentions = discord.AllowedMentions.none()
-    chunks = rk_link_messages(parts)
+    """Send the Link message as ONE normal message: text + server link (with its invite card),
+    and the GIF attached to the same message."""
+    texts, files = [], []
+    for chunk in rk_link_messages(parts):
+        if RK_MEDIA_URL_RX.fullmatch(chunk) and len(files) < 10:
+            path = await rk_media_get(chunk)        # re-upload the GIF itself (no link text)
+            if path:
+                files.append(discord.File(path, filename=f"reklam{len(files)+1}" + os.path.splitext(path)[1]))
+                continue
+        texts.append(chunk)
     try:
-        items, files, texts = [], [], []
-
-        def flush_text():
-            if texts:
-                items.append(discord.ui.TextDisplay("\n".join(texts)[:3900]))
-                texts.clear()
-
-        for chunk in chunks:
-            if RK_MEDIA_URL_RX.fullmatch(chunk) and len(files) < 10:
-                path = await rk_media_get(chunk)
-                if path:
-                    name = f"reklam{len(files)+1}" + os.path.splitext(path)[1]
-                    files.append(discord.File(path, filename=name))
-                    flush_text()
-                    items.append(discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{name}")))
-                    continue
-            texts.append(chunk)
-        flush_text()
-        view = discord.ui.LayoutView(timeout=None)
-        for it in items:
-            view.add_item(it)
-        await ch.send(view=view, files=files, allowed_mentions=no_mentions)
-        return
-    except Exception as e:
-        print(f"reklam link layout-send failed, using fallback: {e}", flush=True)
-    # fallback: a message ends at each GIF (Discord shows files under the text of their own message)
-    try:
-        texts = []
-        for chunk in chunks:
-            if RK_MEDIA_URL_RX.fullmatch(chunk):
-                path = await rk_media_get(chunk)
-                if path:
-                    await ch.send("\n".join(texts)[:2000] or None,
-                                  file=discord.File(path, filename="reklam" + os.path.splitext(path)[1]),
-                                  allowed_mentions=no_mentions)
-                    texts = []
-                    continue
-            texts.append(chunk)
-        if texts:
-            await ch.send("\n".join(texts)[:2000], allowed_mentions=no_mentions)
+        await ch.send("\n".join(texts)[:2000] or None, files=files,
+                      allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         print(f"reklam link auto-send error: {e}", flush=True)
 
