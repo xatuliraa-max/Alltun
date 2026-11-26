@@ -2858,13 +2858,17 @@ async def rk_on_message(message):
             return
         parts = [x.strip() for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
         try:
+            texts, files = [], []
             for chunk in rk_link_messages(parts):
-                if RK_MEDIA_URL_RX.fullmatch(chunk):
-                    path = await rk_media_get(chunk)   # re-upload the GIF itself: shows the GIF, never the link
+                if RK_MEDIA_URL_RX.fullmatch(chunk) and len(files) < 10:
+                    path = await rk_media_get(chunk)   # re-upload the GIF itself (no link text)
                     if path:
-                        await ch.send(file=discord.File(path, filename="reklam" + os.path.splitext(path)[1]))
+                        files.append(discord.File(path, filename=f"reklam{len(files)+1}" + os.path.splitext(path)[1]))
                         continue
-                await ch.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+                texts.append(chunk)
+            # everything goes out as ONE message: text + link, with the GIF attached
+            await ch.send("\n".join(texts)[:2000] or None, files=files,
+                          allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
             print(f"reklam link auto-send error: {e}", flush=True)
         return  # no reply/reference: the link is sent as a normal new message
@@ -6775,7 +6779,7 @@ async def reklam_count_loop_ready():
 bot.add_listener(reklam_count_loop_ready, "on_ready")
 
 
-RK_MEDIA_DIR = os.path.join(DATA_DIR, "reklam_media")
+RK_MEDIA_DIR = os.path.join(DATA_DIR, "reklam_media_v2")
 RK_MEDIA_MAX = 8 * 1024 * 1024
 
 
@@ -6790,21 +6794,32 @@ def rk_media_path(url):
 async def rk_media_get(url):
     """Return a local file for this GIF/image link (downloaded once, then kept so it never expires)."""
     path = rk_media_path(url)
-    if os.path.isfile(path):
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
         return path
     try:
         os.makedirs(RK_MEDIA_DIR, exist_ok=True)
-        timeout = _aiohttp.ClientTimeout(total=25)
-        async with _aiohttp.ClientSession(timeout=timeout) as sess:
+        timeout = _aiohttp.ClientTimeout(total=40)
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; DiscordBot)"}
+        async with _aiohttp.ClientSession(timeout=timeout, headers=headers) as sess:
             async with sess.get(url) as r:
                 ctype = (r.headers.get("Content-Type") or "").lower()
                 if r.status != 200 or not (ctype.startswith("image/") or ctype.startswith("video/")):
+                    print(f"reklam media: bad response {r.status} {ctype} for {url[:80]}", flush=True)
                     return None
-                data = await r.content.read(RK_MEDIA_MAX + 1)
-        if not data or len(data) > RK_MEDIA_MAX:
+                data = bytearray()
+                async for chunk in r.content.iter_chunked(64 * 1024):   # read the WHOLE body
+                    data.extend(chunk)
+                    if len(data) > RK_MEDIA_MAX:
+                        print("reklam media: file too big (>8MB)", flush=True)
+                        return None
+                expected = r.headers.get("Content-Length")
+        if not data or (expected and expected.isdigit() and len(data) != int(expected)):
+            print("reklam media: incomplete download", flush=True)
             return None
-        with open(path, "wb") as f:
+        tmp = path + ".part"
+        with open(tmp, "wb") as f:
             f.write(data)
+        os.replace(tmp, path)
         return path
     except Exception as ex:
         print(f"reklam media download error: {ex}", flush=True)
