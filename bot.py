@@ -2859,6 +2859,11 @@ async def rk_on_message(message):
         parts = [x.strip() for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
         try:
             for chunk in rk_link_messages(parts):
+                if RK_MEDIA_URL_RX.fullmatch(chunk):
+                    path = await rk_media_get(chunk)   # re-upload the GIF itself: shows the GIF, never the link
+                    if path:
+                        await ch.send(file=discord.File(path, filename="reklam" + os.path.splitext(path)[1]))
+                        continue
                 await ch.send(chunk, allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
             print(f"reklam link auto-send error: {e}", flush=True)
@@ -6770,6 +6775,42 @@ async def reklam_count_loop_ready():
 bot.add_listener(reklam_count_loop_ready, "on_ready")
 
 
+RK_MEDIA_DIR = os.path.join(DATA_DIR, "reklam_media")
+RK_MEDIA_MAX = 8 * 1024 * 1024
+
+
+def rk_media_path(url):
+    import hashlib
+    ext = os.path.splitext(url.split("?")[0])[1].lower()
+    if ext not in (".gif", ".png", ".jpg", ".jpeg", ".webp", ".mp4"):
+        ext = ".gif"
+    return os.path.join(RK_MEDIA_DIR, hashlib.sha1(url.encode()).hexdigest() + ext)
+
+
+async def rk_media_get(url):
+    """Return a local file for this GIF/image link (downloaded once, then kept so it never expires)."""
+    path = rk_media_path(url)
+    if os.path.isfile(path):
+        return path
+    try:
+        os.makedirs(RK_MEDIA_DIR, exist_ok=True)
+        timeout = _aiohttp.ClientTimeout(total=25)
+        async with _aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url) as r:
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if r.status != 200 or not (ctype.startswith("image/") or ctype.startswith("video/")):
+                    return None
+                data = await r.content.read(RK_MEDIA_MAX + 1)
+        if not data or len(data) > RK_MEDIA_MAX:
+            return None
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+    except Exception as ex:
+        print(f"reklam media download error: {ex}", flush=True)
+        return None
+
+
 class ReklamLinkModal(discord.ui.Modal, title="Reklam Link Message"):
     def __init__(self, guild):
         super().__init__()
@@ -6791,13 +6832,24 @@ class ReklamLinkModal(discord.ui.Modal, title="Reklam Link Message"):
         if not SEC_INVITE_RX.search(link):
             await interaction.response.send_message("❌ تکایە لینکی بانگهێشتی سێرڤەری Discord دابنێ.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         rk = get_rk(interaction.guild.id)
         rk["server_link"] = link
         rk["link_before"] = self.before_text.value.strip()
         rk["link_after"] = self.after_text.value.strip()
         rk["link_gif"] = ""
         save_config()
-        await interaction.response.send_message("✅ Link auto-message ڕێکخرا. لە کەناڵە دیاریکراوەکانی Reklam هەر نامەیەک وشەی `link` یان `لینک` تیابێت، بۆتەکە ئەم نامەیە دەنێرێت.", ephemeral=True)
+        msg = ("✅ Link auto-message ڕێکخرا. لە کەناڵە دیاریکراوەکانی Reklam هەر نامەیەک وشەی "
+               "`link` یان `لینک` تیابێت، بۆتەکە ئەم نامەیە دەنێرێت.")
+        bad = 0
+        for text in (rk["link_before"], rk["link_after"]):
+            for m in RK_MEDIA_URL_RX.finditer(text):
+                if not await rk_media_get(m.group(0)):
+                    bad += 1
+        if bad:
+            msg += (f"\n⚠ {bad} لینکی GIF/وێنە نەتوانرا دابەزێنرێت (لەوانەیە بەسەرچووبێت، یان فایلەکە "
+                    "گەورەیە، یان لینکی ڕاستەوخۆی وێنە نییە). لینکەکە وەک خۆی دەنێردرێت.")
+        await interaction.followup.send(msg, ephemeral=True)
 
 
 # =========================================================
