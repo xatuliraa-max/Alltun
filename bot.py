@@ -2858,17 +2858,21 @@ async def rk_on_message(message):
             return
         parts = [x.strip() for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
         try:
-            texts, files = [], []
+            # Discord always shows an attached file UNDER the text of its own message, so a message
+            # ends at each GIF: [text written before the GIF + the GIF] then the rest in the next message.
+            texts, no_mentions = [], discord.AllowedMentions.none()
             for chunk in rk_link_messages(parts):
-                if RK_MEDIA_URL_RX.fullmatch(chunk) and len(files) < 10:
+                if RK_MEDIA_URL_RX.fullmatch(chunk):
                     path = await rk_media_get(chunk)   # re-upload the GIF itself (no link text)
                     if path:
-                        files.append(discord.File(path, filename=f"reklam{len(files)+1}" + os.path.splitext(path)[1]))
+                        await ch.send("\n".join(texts)[:2000] or None,
+                                      file=discord.File(path, filename="reklam" + os.path.splitext(path)[1]),
+                                      allowed_mentions=no_mentions)
+                        texts = []
                         continue
                 texts.append(chunk)
-            # everything goes out as ONE message: text + link, with the GIF attached
-            await ch.send("\n".join(texts)[:2000] or None, files=files,
-                          allowed_mentions=discord.AllowedMentions.none())
+            if texts:
+                await ch.send("\n".join(texts)[:2000], allowed_mentions=no_mentions)
         except Exception as e:
             print(f"reklam link auto-send error: {e}", flush=True)
         return  # no reply/reference: the link is sent as a normal new message
