@@ -1265,19 +1265,154 @@ async def on_message(message):
 # 25. SETUP SLASH COMMANDS (per server)
 # =========================================================
 
-@bot.tree.command(name="setlog", description="دیاریکردنی کەناڵی لۆگەکان")
+# ---------------------------------------------------------
+# /setlog : بێ ئۆپشن = پانێل (دروستکردنی کاتێگۆری لۆگ بە یەک کلیک)
+#           لەگەڵ type + channel = وەک جاران یەک لۆگ دەبەستێتەوە
+# ---------------------------------------------------------
+
+LOG_CATEGORY_NAME = "╭┈ ʟᴏɢ'ꜱ ⚘.·"
+# (جۆری لۆگ, ناوی کەناڵ) بە هەمان ناوەکانی ناو سێرڤەرەکەت
+LOG_AUTO_CHANNELS = [
+    ("chat", "chat-log"),
+    ("voice", "voice-log"),
+    ("nickname", "nickname-changed"),
+    ("left", "left-log"),
+    ("ban", "ban-mute"),
+    ("channel", "channel-log"),
+    ("server", "server-log"),
+    ("member", "member-update-log"),
+    ("role", "role-log"),
+]
+_logsetup_running = set()
+
+
+async def create_log_category(guild):
+    """کاتێگۆری لۆگ + هەموو کەناڵەکانی دروست دەکات (ئەوەی هەیە دووبارە دروست ناکاتەوە)
+    و خۆکار هەر کەناڵێک دەبەستێتەوە بە جۆری لۆگەکەی. دەگەڕێنێتەوە (created, reused)"""
+    me = guild.me
+    ow = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, embed_links=True,
+            read_message_history=True, manage_channels=True),
+    }
+    for rid in cfg(guild.id)["dev_roles"]:
+        r = guild.get_role(rid)
+        if r:
+            ow[r] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+
+    reason = "Log category setup"
+    cat = discord.utils.get(guild.categories, name=LOG_CATEGORY_NAME)
+    created, reused = [], []
+    if cat is None:
+        cat = await guild.create_category(LOG_CATEGORY_NAME, overwrites=ow, reason=reason)
+        created.append("📁 " + LOG_CATEGORY_NAME)
+
+    c = cfg(guild.id)
+    for key, name in LOG_AUTO_CHANNELS:
+        ch = discord.utils.get(cat.text_channels, name=name)
+        if ch is None:
+            ch = await guild.create_text_channel(name, category=cat, reason=reason)
+            created.append(f"#{name}")
+        else:
+            reused.append(f"#{name}")
+        c["channels"][key] = ch.id
+        save_config()
+    return created, reused
+
+
+def logsetup_embed(guild):
+    c = cfg(guild.id)
+    lines = []
+    for k, label in LOG_TYPES.items():
+        if k == "welcome":
+            continue
+        cid = c["channels"].get(k)
+        lines.append(f"**{label}:** {f'<#{cid}>' if cid else '❌'}")
+    e = discord.Embed(
+        title="📜 Log Setup",
+        description=(
+            f"دووگمەی خوارەوە کاتێگۆری **{LOG_CATEGORY_NAME}** دروست دەکات و هەموو "
+            "کەناڵەکانی لۆگی تێدا دروست دەکات و خۆکار دەیانبەستێتەوە بە لۆگەکان.\n\n"
+            + "\n".join(lines)
+        ),
+        color=discord.Color.blurple())
+    e.set_footer(text="کەناڵی هەبوو دووبارە دروست ناکرێتەوە، تەنها دەبەسترێتەوە")
+    return e
+
+
+class LogSetupView(discord.ui.View):
+    def __init__(self, author_id):
+        super().__init__(timeout=300)
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.author_id or not is_dev(interaction.user):
+            await deny_interaction(interaction)
+            return False
+        return True
+
+    @discord.ui.button(label="Create Log Category", emoji="⚡", style=discord.ButtonStyle.success)
+    async def create_btn(self, interaction, button):
+        g = interaction.guild
+        if g.id in _logsetup_running:
+            await interaction.response.send_message("کارێک بەردەوامە، چاوەڕێ بکە.", ephemeral=True)
+            return
+        perms = g.me.guild_permissions
+        if not (perms.administrator or perms.manage_channels):
+            await interaction.response.send_message(
+                "❌ بۆتەکە مۆڵەتی **Manage Channels** ی نییە.", ephemeral=True)
+            return
+        _logsetup_running.add(g.id)
+        await interaction.response.edit_message(
+            embed=discord.Embed(description="⏳ لۆگەکان دروست دەکرێن...", color=discord.Color.blurple()),
+            view=None)
+        try:
+            created, reused = await create_log_category(g)
+            note = f"✅ **تەواو بوو**، هەموو لۆگەکان بەسترانەوە.\n\n"
+            if created:
+                note += "**دروستکرا:**\n" + "\n".join(created) + "\n\n"
+            if reused:
+                note += "**پێشتر هەبوو (بەسترایەوە):**\n" + "\n".join(reused)
+            embed = logsetup_embed(g)
+            embed.description = note[:1500] + "\n\n" + (embed.description.split("\n\n", 1)[1])
+        except Exception as ex:
+            print(f"log category setup error: {ex}", flush=True)
+            embed = discord.Embed(title="❌ هەڵە", description=str(ex)[:500], color=discord.Color.red())
+        finally:
+            _logsetup_running.discard(g.id)
+        try:
+            await interaction.edit_original_response(embed=embed, view=LogSetupView(self.author_id))
+        except Exception:
+            pass
+
+
+@bot.tree.command(name="setlog", description="دیاریکردنی کەناڵی لۆگەکان (بێ ئۆپشن = دروستکردنی هەموو لۆگەکان بە یەک کلیک)")
 @app_commands.guild_only()
-@app_commands.describe(type="جۆری لۆگ", channel="کەناڵ")
+@app_commands.describe(type="جۆری لۆگ (ئارەزوومەندانە)", channel="کەناڵ (ئارەزوومەندانە)")
 @app_commands.choices(
     type=[app_commands.Choice(name=v, value=k) for k, v in LOG_TYPES.items() if k != "welcome"]
 )
 async def setlog(
     interaction: discord.Interaction,
-    type: str,
-    channel: discord.TextChannel
+    type: Optional[str] = None,
+    channel: Optional[discord.TextChannel] = None
 ):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
+        return
+
+    if type is None and channel is None:
+        await interaction.response.send_message(
+            embed=logsetup_embed(interaction.guild),
+            view=LogSetupView(interaction.user.id),
+            ephemeral=True)
+        return
+
+    if type is None or channel is None:
+        await interaction.response.send_message(
+            "❌ هەردوو `type` و `channel` پێکەوە بنووسە، یان هیچیان بۆ کردنەوەی پانێل.",
+            ephemeral=True)
         return
 
     cfg(interaction.guild.id)["channels"][type] = channel.id
