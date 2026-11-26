@@ -1,3 +1,4 @@
+from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -2973,6 +2974,10 @@ class RkView(SecBaseView):
         rk["reply"] = not rk["reply"]
         save_config()
         await panel_edit(interaction, self, "rk")
+
+    @discord.ui.button(label="Link", style=discord.ButtonStyle.primary, row=3)
+    async def link_btn(self, interaction, button):
+        await interaction.response.send_modal(ReklamLinkModal(self.guild))
 
     @discord.ui.button(label="Preview", style=discord.ButtonStyle.success, row=4)
     async def preview_btn(self, interaction, button):
@@ -6704,10 +6709,23 @@ bot.add_listener(reklam_count_loop_ready, "on_ready")
 
 
 class ReklamLinkModal(discord.ui.Modal, title="Reklam Link Message"):
-    server_link = discord.ui.TextInput(label="Server invite link", placeholder="https://discord.gg/...", max_length=200)
-    before_text = discord.ui.TextInput(label="Text above link (optional)", style=discord.TextStyle.paragraph, required=False, max_length=900)
-    after_text = discord.ui.TextInput(label="Text below link (optional)", style=discord.TextStyle.paragraph, required=False, max_length=900)
-    gif_link = discord.ui.TextInput(label="GIF / image URL (optional)", required=False, max_length=500)
+    def __init__(self, guild):
+        super().__init__()
+        rk = get_rk(guild.id)
+        self.server_link = discord.ui.TextInput(
+            label="Server invite link", placeholder="https://discord.gg/...",
+            default=rk.get("server_link") or None, max_length=200)
+        self.before_text = discord.ui.TextInput(
+            label="Text above link (optional)", style=discord.TextStyle.paragraph,
+            default=rk.get("link_before") or None, required=False, max_length=900)
+        self.after_text = discord.ui.TextInput(
+            label="Text below link (optional)", style=discord.TextStyle.paragraph,
+            default=rk.get("link_after") or None, required=False, max_length=900)
+        self.gif_link = discord.ui.TextInput(
+            label="GIF / image URL (optional)",
+            default=rk.get("link_gif") or None, required=False, max_length=500)
+        for item in (self.server_link, self.before_text, self.after_text, self.gif_link):
+            self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
         link = self.server_link.value.strip()
@@ -6727,65 +6745,52 @@ class ReklamLinkModal(discord.ui.Modal, title="Reklam Link Message"):
         await interaction.response.send_message("✅ Link auto-message ڕێکخرا. لە کەناڵە دیاریکراوەکانی Reklam وشەی `Link` بنووسە بۆ تاقیکردنەوە.", ephemeral=True)
 
 
-@bot.tree.command(name="reklam-link", description="ڕێکخستنی لینکی خۆکاری Reklam و دەق/GIF")
+@bot.tree.command(name="reklam-counting", description="دیاریکردنی کەناڵی Partner بۆ ژماردن و ناردنی بۆردی Top 25")
 @app_commands.guild_only()
-async def reklam_link_cmd(interaction: discord.Interaction):
-    if not is_dev(interaction.user):
-        await deny_interaction(interaction)
-        return
-    await interaction.response.send_modal(ReklamLinkModal())
-
-
-@bot.tree.command(name="reklam-counting", description="دیاریکردنی تەنها کەناڵی Partner بۆ ژماردنی ڕیکلام")
-@app_commands.guild_only()
-@app_commands.describe(partner_channel="تەنها ئەم کەناڵە بۆ ژماردنی لینکی سێرڤەرەکان")
+@app_commands.describe(
+    partner_channel="تەنها ئەم کەناڵە بۆ ژماردنی لینکی سێرڤەرەکان (ئارەزوومەندانە)",
+    send_board="بۆردی Partner Top 25 لەم کەناڵەی ئێستادا بنێرە (ئارەزوومەندانە)",
+)
 async def reklam_counting_cmd(
     interaction: discord.Interaction,
-    partner_channel: discord.TextChannel,
+    partner_channel: Optional[discord.TextChannel] = None,
+    send_board: bool = False,
 ):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
         return
-    rk = get_rk(interaction.guild.id)
-    rk["partner_enabled"] = True
-    rk["partner_channels"] = list(dict.fromkeys(rk.get("partner_channels", []) + [partner_channel.id]))
-    rk.setdefault("counting", {})["partner_channel"] = partner_channel.id
-    # No board channel is configured and no board is sent automatically.
-    save_config()
-    await interaction.response.send_message(
-        f"✅ کەناڵی Partner بۆ ژماردن دیاریکرا: {partner_channel.mention}\n"
-        "بۆ ناردنی بۆرد، فەرمانی `/reklam-counting-board` لە هەر کەناڵێک بەکاربهێنە.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="reklam-counting-board", description="ناردنی بۆردی Partner Top 25 لەم کەناڵەدا بە دەستی خۆت")
-@app_commands.guild_only()
-async def reklam_counting_board_cmd(interaction: discord.Interaction):
-    if not is_dev(interaction.user):
-        await deny_interaction(interaction)
+    if partner_channel is None and not send_board:
+        await interaction.response.send_message(
+            "ℹ️ کەناڵی Partner دیاری بکە، یان `send_board: True` هەڵبژێرە بۆ ناردنی بۆرد.",
+            ephemeral=True,
+        )
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        embed = reklam_count_embed(interaction.guild)
-        board = await interaction.channel.send(embed=embed)
-        board_info = {"g": interaction.guild.id, "c": interaction.channel.id, "m": board.id}
-        reklam_count_db.setdefault("boards", []).append(board_info)
-        reklam_count_save()
-        _reklam_board_state[board.id] = reklam_count_sig(embed)
-        await interaction.followup.send(
-            f"✅ بۆردی Partner Top 25 لێرە نێردرا: {interaction.channel.mention}\n"
-            "بۆردەکە تەنها بە داواکاری تۆ نێردراوە و دواتر خۆکارانە نوێ دەبێتەوە.",
-            ephemeral=True,
-        )
-    except discord.Forbidden:
-        await interaction.followup.send(
-            "❌ بۆتەکە مۆڵەتی Send Messages و Embed Links لەم کەناڵەدا نییە.",
-            ephemeral=True,
-        )
-    except Exception as ex:
-        print(f"reklam count manual board error: {ex}", flush=True)
-        await interaction.followup.send("❌ نەتوانرا بۆردەکە بنێردرێت.", ephemeral=True)
+    replies = []
+    if partner_channel is not None:
+        rk = get_rk(interaction.guild.id)
+        rk["partner_enabled"] = True
+        rk["partner_channels"] = list(dict.fromkeys(rk.get("partner_channels", []) + [partner_channel.id]))
+        rk.setdefault("counting", {})["partner_channel"] = partner_channel.id
+        save_config()
+        replies.append(f"✅ کەناڵی Partner بۆ ژماردن دیاریکرا: {partner_channel.mention}")
+    if send_board:
+        try:
+            embed = reklam_count_embed(interaction.guild)
+            board = await interaction.channel.send(embed=embed)
+            reklam_count_db.setdefault("boards", []).append(
+                {"g": interaction.guild.id, "c": interaction.channel.id, "m": board.id})
+            reklam_count_save()
+            _reklam_board_state[board.id] = reklam_count_sig(embed)
+            replies.append(
+                f"✅ بۆردی Partner Top 25 لێرە نێردرا: {interaction.channel.mention}\n"
+                "بۆردەکە تەنها بە داواکاری تۆ نێردراوە و دواتر خۆکارانە نوێ دەبێتەوە.")
+        except discord.Forbidden:
+            replies.append("❌ بۆتەکە مۆڵەتی Send Messages و Embed Links لەم کەناڵەدا نییە.")
+        except Exception as ex:
+            print(f"reklam count manual board error: {ex}", flush=True)
+            replies.append("❌ نەتوانرا بۆردەکە بنێردرێت.")
+    await interaction.followup.send("\n".join(replies), ephemeral=True)
 
 
 # =========================================================
