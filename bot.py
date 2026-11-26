@@ -1308,6 +1308,107 @@ async def setlogall(interaction: discord.Interaction, channel: discord.TextChann
 
 
 # ---------------------------------------------------------
+# /setlogcategory : هەموو لۆگەکان لە ناو کاتێگۆریەک بە ناوەکانیانەوە دەبەستێتەوە
+# ---------------------------------------------------------
+import unicodedata as _ud
+
+# ڕیزبەندی گرنگە (nickname پێش member، چونکە nickname-changed نابێت بچێتە member)
+LOG_NAME_HINTS = [
+    ("nickname", ("nickname", "nick")),
+    ("ban", ("ban", "mute")),
+    ("left", ("left", "leave")),
+    ("voice", ("voice",)),
+    ("chat", ("chat", "message")),
+    ("role", ("role",)),
+    ("channel", ("channel",)),
+    ("member", ("member",)),
+    ("server", ("server",)),
+]
+
+
+def log_type_from_name(name):
+    n = _ud.normalize("NFKC", name or "").casefold()
+    for t, hints in LOG_NAME_HINTS:
+        if any(h in n for h in hints):
+            return t
+    return None
+
+
+def _cat_norm(text):
+    return _ud.normalize("NFKC", text or "").casefold().strip()
+
+
+async def _logcat_autocomplete(interaction: discord.Interaction, current: str):
+    cur = _cat_norm(current)
+    out = []
+    for c in interaction.guild.categories:
+        if not cur or cur in _cat_norm(c.name):
+            out.append(app_commands.Choice(name=c.name[:100], value=c.name[:100]))
+    return out[:25]
+
+
+@bot.tree.command(name="setlogcategory",
+                  description="هەموو لۆگەکان لە ناو کاتێگۆریەک بە ناوەکانیانەوە ببەستەوە")
+@app_commands.guild_only()
+@app_commands.describe(category="ناوی کاتێگۆری (هەڵیبژێرە یان ناوەکەی لێرە بنووسە / پەیستی بکە)")
+@app_commands.autocomplete(category=_logcat_autocomplete)
+async def setlogcategory(interaction: discord.Interaction, category: str):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    g = interaction.guild
+    want = category.strip()
+    cats = list(g.categories)
+    found = [c for c in cats if c.name.strip() == want]
+    if not found:
+        found = [c for c in cats if _cat_norm(c.name) == _cat_norm(want)]
+    if not found:
+        found = [c for c in cats if _cat_norm(want) and _cat_norm(want) in _cat_norm(c.name)]
+    if not found:
+        await interaction.response.send_message("❌ هیچ کاتێگۆریەک بەم ناوە نەدۆزرایەوە.", ephemeral=True)
+        return
+    if len(found) > 1:
+        names = "\n".join(f"• {c.name}" for c in found[:10])
+        await interaction.response.send_message(
+            f"❌ چەند کاتێگۆریەک بەم ناوە هەن، ناوەکە ورد بنووسە:\n{names}", ephemeral=True)
+        return
+    cat = found[0]
+
+    assigned, unmatched = {}, []
+    for ch in sorted(cat.channels, key=lambda c: c.position):
+        if not isinstance(ch, discord.TextChannel):
+            continue
+        t = log_type_from_name(ch.name)
+        if t is None or t in assigned:
+            unmatched.append(ch)
+        else:
+            assigned[t] = ch
+    if not assigned:
+        await interaction.response.send_message(
+            "❌ لە ناو ئەم کاتێگۆریەدا هیچ کەناڵێکی لۆگ نەدۆزرایەوە (ناوی کەناڵەکان وەک `server-log` ، `chat-log` ... بن).",
+            ephemeral=True)
+        return
+
+    c = cfg(g.id)
+    for t, ch in assigned.items():
+        c["channels"][t] = ch.id
+    save_config()
+
+    lines = []
+    for k, label in LOG_TYPES.items():
+        if k == "welcome":
+            continue
+        lines.append(f"**{label}:** " + (assigned[k].mention if k in assigned else "❌ نەدۆزرایەوە"))
+    desc = f"📁 **{cat.name}**\n\n" + "\n".join(lines)
+    if unmatched:
+        desc += "\n\n➖ ئەم کەناڵانە نەبەسترانەوە:\n" + " ".join(ch.mention for ch in unmatched[:15])
+    await interaction.response.send_message(
+        embed=discord.Embed(title="✅ لۆگەکان بەسترانەوە", description=desc[:4000],
+                            color=discord.Color.green()),
+        ephemeral=True)
+
+
+# ---------------------------------------------------------
 # /rolemute  /roleban  /rolesafika  /rolestaff
 # ---------------------------------------------------------
 
@@ -5167,11 +5268,12 @@ async def cc_paste(guild, tpl, upd):
 
     # ---- ڕۆڵەکان ----
     role_map = {tpl["everyone_id"]: guild.default_role}
-    try:
-        ev = tpl["everyone_perms"] if bot_admin else tpl["everyone_perms"] & bot_perms
-        await guild.default_role.edit(permissions=discord.Permissions(ev), reason=reason)
-    except Exception as ex:
-        fail("@everyone", ex)
+    if not tpl.get("skip_everyone"):
+        try:
+            ev = tpl["everyone_perms"] if bot_admin else tpl["everyone_perms"] & bot_perms
+            await guild.default_role.edit(permissions=discord.Permissions(ev), reason=reason)
+        except Exception as ex:
+            fail("@everyone", ex)
 
     existing = {r.name: r for r in guild.roles if not r.is_default() and not r.managed}
 
@@ -5263,31 +5365,32 @@ async def cc_paste(guild, tpl, upd):
             fail(f"#{cd['name']}", ex)
 
     # ---- ڕێکخستنی سێرڤەر ----
-    await upd("⚙️ ڕێکخستنی سێرڤەر...", force=True)
-    st = tpl["settings"]
-    base = {"name": st["name"]}
-    for k, attr, enum in (("verification", "verification_level", discord.VerificationLevel),
-                          ("notifications", "default_notifications", discord.NotificationLevel),
-                          ("content_filter", "explicit_content_filter", discord.ContentFilter)):
+    if not tpl.get("skip_settings"):
+        await upd("⚙️ ڕێکخستنی سێرڤەر...", force=True)
+        st = tpl["settings"]
+        base = {"name": st["name"]}
+        for k, attr, enum in (("verification", "verification_level", discord.VerificationLevel),
+                              ("notifications", "default_notifications", discord.NotificationLevel),
+                              ("content_filter", "explicit_content_filter", discord.ContentFilter)):
+            try:
+                base[attr] = enum(st[k])
+            except Exception:
+                pass
+        base["afk_timeout"] = st.get("afk_timeout", 300)
+        if st.get("afk_channel") in chan_map and isinstance(chan_map[st["afk_channel"]], discord.VoiceChannel):
+            base["afk_channel"] = chan_map[st["afk_channel"]]
+        if st.get("system_channel") in chan_map and isinstance(chan_map[st["system_channel"]], discord.TextChannel):
+            base["system_channel"] = chan_map[st["system_channel"]]
         try:
-            base[attr] = enum(st[k])
-        except Exception:
-            pass
-    base["afk_timeout"] = st.get("afk_timeout", 300)
-    if st.get("afk_channel") in chan_map and isinstance(chan_map[st["afk_channel"]], discord.VoiceChannel):
-        base["afk_channel"] = chan_map[st["afk_channel"]]
-    if st.get("system_channel") in chan_map and isinstance(chan_map[st["system_channel"]], discord.TextChannel):
-        base["system_channel"] = chan_map[st["system_channel"]]
-    try:
-        kw = dict(base)
-        if st.get("icon"):
-            kw["icon"] = _b64.b64decode(st["icon"])
-        await guild.edit(reason=reason, **kw)
-    except Exception as ex:
-        try:
-            await guild.edit(reason=reason, name=st["name"])
-        except Exception as ex2:
-            fail("server settings", ex2)
+            kw = dict(base)
+            if st.get("icon"):
+                kw["icon"] = _b64.b64decode(st["icon"])
+            await guild.edit(reason=reason, **kw)
+        except Exception as ex:
+            try:
+                await guild.edit(reason=reason, name=st["name"])
+            except Exception as ex2:
+                fail("server settings", ex2)
 
     # ---- ئیمۆجی ----
     bad = 0
@@ -5446,6 +5549,16 @@ class CcTplView(CcBaseView):
     async def paste_btn(self, interaction, button):
         await self._ask(interaction, "paste")
 
+    @discord.ui.button(label="Choose what to paste", emoji="🎯", style=discord.ButtonStyle.success, row=0)
+    async def pick_btn(self, interaction, button):
+        try:
+            tpl = cc_load(self.key)
+        except Exception:
+            await interaction.response.edit_message(embed=cc_main_embed(), view=CcMainView())
+            return
+        pv = CcPickView(self.key, tpl)
+        await interaction.response.edit_message(embed=pv.embed(), view=pv)
+
     @discord.ui.button(label="Delete saved copy", emoji="🗑", style=discord.ButtonStyle.secondary, row=1)
     async def del_btn(self, interaction, button):
         await self._ask(interaction, "delete")
@@ -5472,10 +5585,12 @@ class CcTplView(CcBaseView):
 
 
 class CcConfirmView(CcBaseView):
-    def __init__(self, key, mode):
+    def __init__(self, key, mode, tpl=None, pick=None):
         super().__init__()
         self.key = key
         self.mode = mode
+        self.tpl = tpl          # فلتەرکراو (تەنها ئەوەی هەڵت بژاردووە)
+        self.pick = pick
 
     @discord.ui.button(label="بەڵێ", emoji="✅", style=discord.ButtonStyle.success, row=0)
     async def yes_btn(self, interaction, button):
@@ -5487,6 +5602,10 @@ class CcConfirmView(CcBaseView):
 
     @discord.ui.button(label="نەخێر", emoji="✖️", style=discord.ButtonStyle.secondary, row=0)
     async def no_btn(self, interaction, button):
+        if self.pick is not None:
+            pv = self.pick.clone()
+            await interaction.response.edit_message(embed=pv.embed(), view=pv)
+            return
         try:
             meta = cc_load_meta(self.key)
             await interaction.response.edit_message(embed=cc_tpl_embed(meta), view=CcTplView(self.key))
@@ -5526,7 +5645,7 @@ class CcConfirmView(CcBaseView):
             await interaction.response.send_message("کارێک لەم سێرڤەرە بەردەوامە، چاوەڕێ بکە.", ephemeral=True)
             return
         try:
-            tpl = cc_load(self.key)
+            tpl = self.tpl if self.tpl is not None else cc_load(self.key)
         except Exception:
             await interaction.response.edit_message(embed=cc_main_embed(), view=CcMainView())
             return
@@ -5549,6 +5668,167 @@ class CcConfirmView(CcBaseView):
         except Exception:
             # کەناڵی فەرمانەکە ڕەنگە سڕابێتەوە / تۆکنی ئینتەراکشن بەسەرچووبێت
             pass
+
+
+# ---------- هەڵبژاردنی کاتێگۆری و شتەکان بۆ Paste ----------
+
+CC_NOCAT = 0          # "کەناڵی بێ کاتێگۆری"
+CC_ROLE_MODES = {"all": "هەموو", "needed": "تەنها پێویست", "none": "هیچ"}
+
+
+def cc_filter_tpl(tpl, sel, roles_mode, emojis_on, cfg_on, settings_on):
+    cats = [c for c in tpl["cats"] if c["id"] in sel]
+    cat_ids = {c["id"] for c in cats}
+    chans = [c for c in tpl["chans"]
+             if c["cat"] in cat_ids or (c["cat"] is None and CC_NOCAT in sel)]
+    if roles_mode == "all":
+        roles = list(tpl["roles"])
+    elif roles_mode == "needed":
+        need = set()
+        for x in cats + chans:
+            need.update(o["id"] for o in x.get("ow", []))
+        roles = [r for r in tpl["roles"] if r["id"] in need]
+    else:
+        roles = []
+    out = dict(tpl)
+    out.update(
+        cats=cats, chans=chans, roles=roles,
+        emojis=list(tpl.get("emojis", [])) if emojis_on else [],
+        bot_cfg=tpl.get("bot_cfg", {}) if cfg_on else {},
+        skip_settings=not settings_on,
+        skip_everyone=(roles_mode != "all"),
+    )
+    return out
+
+
+class CcPickSelect(discord.ui.Select):
+    def __init__(self, pv, chunk, row):
+        opts = [discord.SelectOption(label=label[:100], value=str(cid), description=desc[:100],
+                                     default=(cid in pv.sel))
+                for cid, label, desc in chunk]
+        super().__init__(placeholder="📁 کاتێگۆریەکان هەڵبژێرە...", options=opts,
+                         min_values=0, max_values=len(opts), row=row)
+        self.pv = pv
+        self.chunk_ids = {c[0] for c in chunk}
+
+    async def callback(self, interaction):
+        self.pv.sel -= self.chunk_ids
+        self.pv.sel |= {int(v) for v in self.values}
+        await self.pv.refresh(interaction)
+
+
+class CcPickView(CcBaseView):
+    def __init__(self, key, tpl, sel=None, roles_mode="all", emojis_on=True, cfg_on=True, settings_on=True):
+        super().__init__()
+        self.key, self.tpl = key, tpl
+        self.sel = set(sel or ())
+        self.roles_mode, self.emojis_on = roles_mode, emojis_on
+        self.cfg_on, self.settings_on = cfg_on, settings_on
+
+        counts = {}
+        for ch in tpl["chans"]:
+            counts[ch["cat"]] = counts.get(ch["cat"], 0) + 1
+        entries = []
+        if counts.get(None):
+            entries.append((CC_NOCAT, "📂 کەناڵی بێ کاتێگۆری", f"{counts[None]} کەناڵ"))
+        for c in sorted(tpl["cats"], key=lambda c: c["pos"]):
+            entries.append((c["id"], "📁 " + (c["name"] or "-"), f"{counts.get(c['id'], 0)} کەناڵ"))
+        entries = entries[:75]
+        chunks = [entries[i:i + 25] for i in range(0, len(entries), 25)]
+        for r, chunk in enumerate(chunks):
+            self.add_item(CcPickSelect(self, chunk, r))
+        r0 = len(chunks)
+
+        def btn(label, style, row, cb, emoji=None):
+            b = discord.ui.Button(label=label, style=style, row=row, emoji=emoji)
+            b.callback = cb
+            self.add_item(b)
+
+        sec, suc, pri = discord.ButtonStyle.secondary, discord.ButtonStyle.success, discord.ButtonStyle.primary
+        on = lambda v: suc if v else sec
+        btn("Select all", sec, r0, self.all_cb, "✅")
+        btn("Clear", sec, r0, self.none_cb, "✖️")
+        btn(f"Roles: {CC_ROLE_MODES[roles_mode]}", on(roles_mode != "none"), r0, self.roles_cb, "🎭")
+        btn("Emojis: " + ("ON" if emojis_on else "OFF"), on(emojis_on), r0, self.emoji_cb, "😀")
+        btn("Bot settings: " + ("ON" if cfg_on else "OFF"), on(cfg_on), r0 + 1, self.cfg_cb, "⚙️")
+        btn("Server name/icon: " + ("ON" if settings_on else "OFF"), on(settings_on), r0 + 1, self.set_cb, "🖼")
+        btn("Paste", pri, r0 + 1, self.paste_cb, "📤")
+        btn("Back", sec, r0 + 1, self.back_cb, "↩️")
+
+    def clone(self):
+        return CcPickView(self.key, self.tpl, self.sel, self.roles_mode,
+                          self.emojis_on, self.cfg_on, self.settings_on)
+
+    def filtered(self):
+        return cc_filter_tpl(self.tpl, self.sel, self.roles_mode, self.emojis_on, self.cfg_on, self.settings_on)
+
+    def embed(self):
+        f = self.filtered()
+        names = [c["name"] for c in f["cats"]]
+        if CC_NOCAT in self.sel:
+            names.insert(0, "کەناڵی بێ کاتێگۆری")
+        listing = "\n".join(f"• {n}" for n in names[:15]) or "هیچ نییە"
+        if len(names) > 15:
+            listing += f"\n... +{len(names) - 15}"
+        desc = (f"**ئەمەی هەڵت بژاردووە:**\n{listing}\n\n"
+                f"📁 کاتێگۆری: **{len(f['cats'])}** ⋅ 💬 کەناڵ: **{len(f['chans'])}**\n"
+                f"🎭 ڕۆڵ: **{len(f['roles'])}** ⋅ 😀 ئیمۆجی: **{len(f['emojis'])}**\n"
+                f"⚙️ ڕێکخستنی بۆت: **{'بەڵێ' if self.cfg_on else 'نەخێر'}** ⋅ "
+                f"🖼 ناو/ئایکۆنی سێرڤەر: **{'بەڵێ' if self.settings_on else 'نەخێر'}**")
+        return discord.Embed(title=f"🎯 {self.tpl.get('name', '')} — هەڵبژاردن", description=desc[:4000],
+                             color=CC_COLOR)
+
+    async def refresh(self, interaction):
+        pv = self.clone()
+        await interaction.response.edit_message(embed=pv.embed(), view=pv)
+
+    async def all_cb(self, interaction):
+        ids = {c["id"] for c in self.tpl["cats"]}
+        if any(c["cat"] is None for c in self.tpl["chans"]):
+            ids.add(CC_NOCAT)
+        self.sel = ids
+        await self.refresh(interaction)
+
+    async def none_cb(self, interaction):
+        self.sel = set()
+        await self.refresh(interaction)
+
+    async def roles_cb(self, interaction):
+        order = ["all", "needed", "none"]
+        self.roles_mode = order[(order.index(self.roles_mode) + 1) % 3]
+        await self.refresh(interaction)
+
+    async def emoji_cb(self, interaction):
+        self.emojis_on = not self.emojis_on
+        await self.refresh(interaction)
+
+    async def cfg_cb(self, interaction):
+        self.cfg_on = not self.cfg_on
+        await self.refresh(interaction)
+
+    async def set_cb(self, interaction):
+        self.settings_on = not self.settings_on
+        await self.refresh(interaction)
+
+    async def back_cb(self, interaction):
+        try:
+            meta = cc_load_meta(self.key)
+            await interaction.response.edit_message(embed=cc_tpl_embed(meta), view=CcTplView(self.key))
+        except Exception:
+            await interaction.response.edit_message(embed=cc_main_embed(), view=CcMainView())
+
+    async def paste_cb(self, interaction):
+        f = self.filtered()
+        if not (f["cats"] or f["chans"] or f["roles"] or f["emojis"] or self.cfg_on or self.settings_on):
+            await interaction.response.send_message("هیچ شتێک هەڵنەبژێردراوە.", ephemeral=True)
+            return
+        g = interaction.guild
+        text = (f"ئەمە لە **{g.name}** دابنرێت؟ (هیچ شتێک ناسڕدرێتەوە)\n\n"
+                f"📁 {len(f['cats'])} کاتێگۆری ⋅ 💬 {len(f['chans'])} کەناڵ ⋅ "
+                f"🎭 {len(f['roles'])} ڕۆڵ ⋅ 😀 {len(f['emojis'])} ئیمۆجی")
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="دڵنیایت؟", description=text, color=discord.Color.orange()),
+            view=CcConfirmView(self.key, "paste", tpl=f, pick=self))
 
 
 @bot.tree.command(name="create_channels", description="کۆپیکردن و دانانەوەی سێرڤەر (تەنها خاوەنی بۆت)")
@@ -6160,7 +6440,7 @@ HELP_TEXT = {
 
 HELP_SHORT = {
     "mod": "mute ⋅ unmute ⋅ bfra ⋅ unban ⋅ safika ⋅ lock ⋅ unlock",
-    "setup": "/setlog ⋅ /setlogall ⋅ /setmuterole ⋅ /autorole ⋅ /welcome ⋅ /counting ⋅ /config",
+    "setup": "/setlog ⋅ /setlogall ⋅ /setlogcategory ⋅ /setmuterole ⋅ /autorole ⋅ /welcome ⋅ /counting ⋅ /config",
     "roles": "/setdev ⋅ /rolemute ⋅ /roleban ⋅ /rolesafika ⋅ /rolestaff ⋅ /staff ⋅ /rangi-role ⋅ /regri",
     "protect": "/security ⋅ /blocklink ⋅ /reklam ⋅ /autoreact",
     "fun": "/xp ⋅ /setxp ⋅ ship ⋅ kiss ⋅ hug ⋅ pat ⋅ /setlove ⋅ /song-texts",
