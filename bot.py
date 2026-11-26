@@ -6607,10 +6607,13 @@ def reklam_invite_links(message):
 async def reklam_count_message(message):
     if message.guild is None or message.author.bot:
         return
+    # Same channels as pt_check (every Partner channel), and the same rules for EVERYONE:
+    # owner, administrator, developer and normal members are all counted (no exemption).
     rk = get_rk(message.guild.id)
-    counting = rk.get("counting", {})
-    partner_id = counting.get("partner_channel")
-    if not partner_id or (message.channel.id != partner_id and getattr(message.channel, "parent_id", None) != partner_id):
+    partner_id = rk.get("counting", {}).get("partner_channel")
+    in_counting_ch = bool(partner_id) and (
+        message.channel.id == partner_id or getattr(message.channel, "parent_id", None) == partner_id)
+    if not (is_partner_channel(message) or in_counting_ch):
         return
     # The same restrictions as Partner: no stickers/images/attachments, only invite links.
     if msg_has_attached_image(message):
