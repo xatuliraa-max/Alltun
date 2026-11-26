@@ -458,7 +458,9 @@ async def on_member_join(member):
         if channel is None:
             continue
         try:
-            await channel.send(embed=build_welcome_embed(member))
+            await channel.send(
+                content=member.mention, embed=build_welcome_embed(member),
+                allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False))
         except Exception:
             pass
 
@@ -1440,107 +1442,6 @@ async def setlogall(interaction: discord.Interaction, channel: discord.TextChann
     await interaction.response.send_message(
         f"✅ هەموو لۆگەکان → {channel.mention}", ephemeral=True
     )
-
-
-# ---------------------------------------------------------
-# /setlogcategory : هەموو لۆگەکان لە ناو کاتێگۆریەک بە ناوەکانیانەوە دەبەستێتەوە
-# ---------------------------------------------------------
-import unicodedata as _ud
-
-# ڕیزبەندی گرنگە (nickname پێش member، چونکە nickname-changed نابێت بچێتە member)
-LOG_NAME_HINTS = [
-    ("nickname", ("nickname", "nick")),
-    ("ban", ("ban", "mute")),
-    ("left", ("left", "leave")),
-    ("voice", ("voice",)),
-    ("chat", ("chat", "message")),
-    ("role", ("role",)),
-    ("channel", ("channel",)),
-    ("member", ("member",)),
-    ("server", ("server",)),
-]
-
-
-def log_type_from_name(name):
-    n = _ud.normalize("NFKC", name or "").casefold()
-    for t, hints in LOG_NAME_HINTS:
-        if any(h in n for h in hints):
-            return t
-    return None
-
-
-def _cat_norm(text):
-    return _ud.normalize("NFKC", text or "").casefold().strip()
-
-
-async def _logcat_autocomplete(interaction: discord.Interaction, current: str):
-    cur = _cat_norm(current)
-    out = []
-    for c in interaction.guild.categories:
-        if not cur or cur in _cat_norm(c.name):
-            out.append(app_commands.Choice(name=c.name[:100], value=c.name[:100]))
-    return out[:25]
-
-
-@bot.tree.command(name="setlogcategory",
-                  description="هەموو لۆگەکان لە ناو کاتێگۆریەک بە ناوەکانیانەوە ببەستەوە")
-@app_commands.guild_only()
-@app_commands.describe(category="ناوی کاتێگۆری (هەڵیبژێرە یان ناوەکەی لێرە بنووسە / پەیستی بکە)")
-@app_commands.autocomplete(category=_logcat_autocomplete)
-async def setlogcategory(interaction: discord.Interaction, category: str):
-    if not is_dev(interaction.user):
-        await deny_interaction(interaction)
-        return
-    g = interaction.guild
-    want = category.strip()
-    cats = list(g.categories)
-    found = [c for c in cats if c.name.strip() == want]
-    if not found:
-        found = [c for c in cats if _cat_norm(c.name) == _cat_norm(want)]
-    if not found:
-        found = [c for c in cats if _cat_norm(want) and _cat_norm(want) in _cat_norm(c.name)]
-    if not found:
-        await interaction.response.send_message("❌ هیچ کاتێگۆریەک بەم ناوە نەدۆزرایەوە.", ephemeral=True)
-        return
-    if len(found) > 1:
-        names = "\n".join(f"• {c.name}" for c in found[:10])
-        await interaction.response.send_message(
-            f"❌ چەند کاتێگۆریەک بەم ناوە هەن، ناوەکە ورد بنووسە:\n{names}", ephemeral=True)
-        return
-    cat = found[0]
-
-    assigned, unmatched = {}, []
-    for ch in sorted(cat.channels, key=lambda c: c.position):
-        if not isinstance(ch, discord.TextChannel):
-            continue
-        t = log_type_from_name(ch.name)
-        if t is None or t in assigned:
-            unmatched.append(ch)
-        else:
-            assigned[t] = ch
-    if not assigned:
-        await interaction.response.send_message(
-            "❌ لە ناو ئەم کاتێگۆریەدا هیچ کەناڵێکی لۆگ نەدۆزرایەوە (ناوی کەناڵەکان وەک `server-log` ، `chat-log` ... بن).",
-            ephemeral=True)
-        return
-
-    c = cfg(g.id)
-    for t, ch in assigned.items():
-        c["channels"][t] = ch.id
-    save_config()
-
-    lines = []
-    for k, label in LOG_TYPES.items():
-        if k == "welcome":
-            continue
-        lines.append(f"**{label}:** " + (assigned[k].mention if k in assigned else "❌ نەدۆزرایەوە"))
-    desc = f"📁 **{cat.name}**\n\n" + "\n".join(lines)
-    if unmatched:
-        desc += "\n\n➖ ئەم کەناڵانە نەبەسترانەوە:\n" + " ".join(ch.mention for ch in unmatched[:15])
-    await interaction.response.send_message(
-        embed=discord.Embed(title="✅ لۆگەکان بەسترانەوە", description=desc[:4000],
-                            color=discord.Color.green()),
-        ephemeral=True)
 
 
 # ---------------------------------------------------------
@@ -3063,19 +2964,28 @@ def get_rk(gid):
     return rk
 
 
-def rk_build_embed(guild, member):
+def rk_roles_text(guild):
     rk = get_rk(guild.id)
-    roles_text = " ".join(f"<@&{r}>" for r in rk["tag_roles"] if guild.get_role(r))
+    return " ".join(f"<@&{r}>" for r in rk["tag_roles"] if guild.get_role(r))
+
+
+def rk_roles_mentions(guild):
+    rk = get_rk(guild.id)
+    return discord.AllowedMentions(
+        roles=[guild.get_role(r) for r in rk["tag_roles"] if guild.get_role(r)],
+        users=False, everyone=False, replied_user=False)
+
+
+def rk_build_embed(guild, member):
+    # ڕۆڵەکان لەدەرەوەی ئیمبێد تاگ دەکرێن (rk_roles_text)، چونکە لەناو ئیمبێد نۆتیفیکەیشن ناچێت
+    rk = get_rk(guild.id)
     text = (rk["text"] or "").replace("{user}", member.mention).replace("{server}", guild.name)
-    if "{roles}" in text:
-        text = text.replace("{roles}", roles_text)
-    elif roles_text:
-        text += "\n\n" + roles_text
+    text = text.replace("{roles}", "").strip()
 
     embed = discord.Embed(
         title=rk["title"] or None,
         description=text[:4000] or None,
-        color=discord.Color.blurple()
+        color=discord.Color.from_rgb(255, 255, 255)
     )
     if rk["image"]:
         embed.set_image(url=rk["image"])
@@ -3123,10 +3033,12 @@ async def rk_on_message(message):
 
     try:
         embed = rk_build_embed(g, message.author)
+        tags = rk_roles_text(g) or None
+        am = rk_roles_mentions(g)
         if rk["reply"]:
-            await message.reply(embed=embed, mention_author=False)
+            await message.reply(content=tags, embed=embed, mention_author=False, allowed_mentions=am)
         else:
-            await ch.send(embed=embed)
+            await ch.send(content=tags, embed=embed, allowed_mentions=am)
     except Exception as e:
         print(f"reklam error: {e}")
 
@@ -3254,7 +3166,9 @@ class RkView(SecBaseView):
     async def preview_btn(self, interaction, button):
         try:
             await interaction.response.send_message(
-                embed=rk_build_embed(self.guild, interaction.user), ephemeral=True)
+                content=rk_roles_text(self.guild) or None,
+                embed=rk_build_embed(self.guild, interaction.user), ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
             await interaction.response.send_message(f"❌ {e}", ephemeral=True)
 
@@ -4144,7 +4058,8 @@ def get_welcome_channels(gid):
 def build_welcome_embed(member):
     c = cfg(member.guild.id)
     text = c["welcome_text"].replace("{server}", member.guild.name)
-    embed = discord.Embed(title="WELCOME", description=f"{member.mention}\n{text}")
+    embed = discord.Embed(title="WELCOME", description=f"{member.mention}\n{text}",
+                          color=discord.Color.from_rgb(255, 255, 255))
     embed.set_thumbnail(url=member.display_avatar.url)
     if c.get("welcome_image"):
         embed.set_image(url=c["welcome_image"])
@@ -6575,7 +6490,7 @@ HELP_TEXT = {
 
 HELP_SHORT = {
     "mod": "mute ⋅ unmute ⋅ bfra ⋅ unban ⋅ safika ⋅ lock ⋅ unlock",
-    "setup": "/setlog ⋅ /setlogall ⋅ /setlogcategory ⋅ /setmuterole ⋅ /autorole ⋅ /welcome ⋅ /counting ⋅ /config",
+    "setup": "/setlog ⋅ /setlogall ⋅ /setmuterole ⋅ /autorole ⋅ /welcome ⋅ /counting ⋅ /config",
     "roles": "/setdev ⋅ /rolemute ⋅ /roleban ⋅ /rolesafika ⋅ /rolestaff ⋅ /staff ⋅ /rangi-role ⋅ /regri",
     "protect": "/security ⋅ /blocklink ⋅ /reklam ⋅ /autoreact",
     "fun": "/xp ⋅ /setxp ⋅ ship ⋅ kiss ⋅ hug ⋅ pat ⋅ /setlove ⋅ /song-texts",
