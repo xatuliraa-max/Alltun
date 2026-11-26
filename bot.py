@@ -68,6 +68,8 @@ STAFF_LABELS = {
     "staff2": "Boy Staff",
 }
 
+BOT_OWNER_ID = 1130455970494025860  # Bot owner: full control without needing a server role
+
 NO_PERM_TEXT = "To regat penadrawa ta ama bakar bhenit"
 
 try:
@@ -139,7 +141,7 @@ def is_blacklisted(member, key):
 def has_cmd_access(member, key):
     """Owner + Administrator + roles chosen with /rolemute /roleban /rolesafika"""
     try:
-        if member.id == member.guild.owner_id:
+        if member.id in (BOT_OWNER_ID, member.guild.owner_id):
             return True
         if is_blacklisted(member, key):
             return False
@@ -154,7 +156,7 @@ def has_cmd_access(member, key):
 def is_dev(member):
     """Owner + roles chosen with /setdev (NOT every administrator)"""
     try:
-        if member.id == member.guild.owner_id:
+        if member.id in (BOT_OWNER_ID, member.guild.owner_id):
             return True
         dev = cfg(member.guild.id)["dev_roles"]
         return any(r.id in dev for r in member.roles)
@@ -238,7 +240,7 @@ def hierarchy_error(author, target):
         return "❌ ناتوانیت ئەمە لەسەر خۆت بکەیت."
     if target.id == guild.owner_id:
         return "❌ ناتوانیت ئەمە لەسەر خاوەنی سێرڤەر بکەیت."
-    if author.id == guild.owner_id or author.guild_permissions.administrator:
+    if author.id in (BOT_OWNER_ID, guild.owner_id) or author.guild_permissions.administrator:
         return None
     if target.top_role >= author.top_role:
         return "❌ ناتوانیت ئەمە لەسەر کەسێک بکەیت کە ڕۆڵەکەی بەرزترە یان یەکسانە لەگەڵ ڕۆڵی تۆ."
@@ -1020,6 +1022,7 @@ async def on_message(message):
     if (
         mute_role
         and mute_role in message.author.roles
+        and message.author.id != BOT_OWNER_ID
         and not message.author.guild_permissions.administrator
     ):
         try:
@@ -1236,7 +1239,7 @@ async def on_message(message):
 
     # ---------------- LOCK ----------------
     if command == "lock":
-        if not message.author.guild_permissions.manage_channels:
+        if message.author.id != BOT_OWNER_ID and not message.author.guild_permissions.manage_channels:
             return
         try:
             await message.channel.set_permissions(message.guild.default_role, send_messages=False)
@@ -1247,7 +1250,7 @@ async def on_message(message):
 
     # ---------------- UNLOCK ----------------
     if command == "unlock":
-        if not message.author.guild_permissions.manage_channels:
+        if message.author.id != BOT_OWNER_ID and not message.author.guild_permissions.manage_channels:
             return
         try:
             await message.channel.set_permissions(message.guild.default_role, send_messages=None)
@@ -1263,7 +1266,6 @@ async def on_message(message):
 
 @bot.tree.command(name="setlog", description="دیاریکردنی کەناڵی لۆگەکان")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(type="جۆری لۆگ", channel="کەناڵ")
 @app_commands.choices(
     type=[app_commands.Choice(name=v, value=k) for k, v in LOG_TYPES.items() if k != "welcome"]
@@ -1287,7 +1289,6 @@ async def setlog(
 
 @bot.tree.command(name="setlogall", description="هەموو لۆگەکان بخە یەک کەناڵەوە")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(channel="کەناڵی هەموو لۆگەکان")
 async def setlogall(interaction: discord.Interaction, channel: discord.TextChannel):
     if not is_dev(interaction.user):
@@ -1343,7 +1344,6 @@ PERM_ACTION_CHOICES = [
 
 @bot.tree.command(name="setmuterole", description="دیاریکردنی ئەو ڕۆڵەی لە کاتی Mute دەدرێت بە کەسەکە")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(role="ڕۆڵی Mute (بۆ نموونە Muted)")
 async def setmuterole(interaction: discord.Interaction, role: discord.Role):
     if not is_dev(interaction.user):
@@ -1375,14 +1375,12 @@ async def setmuterole(interaction: discord.Interaction, role: discord.Role):
 
 @bot.tree.command(name="autorole", description="ڕۆڵە خۆکارەکان بۆ ئەندامی نوێ (چەند ڕۆڵ)")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def autorole_cmd(interaction: discord.Interaction):
     await open_perm_panel(interaction, "auto")
 
 
 @bot.tree.command(name="config", description="پیشاندانی ڕێکخستنەکانی ئەم سێرڤەرە")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def config_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -2296,7 +2294,6 @@ class SecWhitelistView(SecBaseView):
 
 @bot.tree.command(name="security", description="سیستمی پاراستن (Anti-Spam / Anti-Nuke)")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def security_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -2743,7 +2740,6 @@ class ArPickView(SecBaseView):
 
 @bot.tree.command(name="autoreact", description="ڕیاکتی خۆکار لە چەند کەناڵێک")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def autoreact_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -2777,6 +2773,12 @@ def get_rk(gid):
     rk.setdefault("reply", False)
     rk.setdefault("partner_enabled", True)
     rk.setdefault("partner_channels", [])
+    # Auto-publish the server invite when someone types Link/link in a selected Reklam channel.
+    rk.setdefault("server_link", "")
+    rk.setdefault("link_before", "")
+    rk.setdefault("link_after", "")
+    rk.setdefault("link_gif", "")
+    rk.setdefault("counting", {"partner_channel": None, "board_channel": None, "board_message": None})
     return rk
 
 
@@ -2816,7 +2818,29 @@ async def rk_on_message(message):
     ch = message.channel
     if ch.id not in rk["channels"] and getattr(ch, "parent_id", None) not in rk["channels"]:
         return
-    if (message.content or "").strip().lower() not in {t.lower() for t in rk["triggers"]}:
+    trigger_text = (message.content or "").strip().casefold()
+    if trigger_text == "link":
+        if any(r.id in rk["blocked_roles"] for r in message.author.roles):
+            return
+        invite = (rk.get("server_link") or "").strip()
+        if not invite:
+            return
+        parts = [x.strip() for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
+        body = "\n".join(parts)
+        gif = (rk.get("link_gif") or "").strip()
+        try:
+            if gif:
+                if not gif.lower().startswith(("https://", "http://")):
+                    return
+                em = discord.Embed(description=body, color=discord.Color.blurple())
+                em.set_image(url=gif)
+                await ch.send(embed=em, allowed_mentions=discord.AllowedMentions.none())
+            else:
+                await ch.send(body, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:
+            print(f"reklam link auto-send error: {e}", flush=True)
+        return  # no reply/reference: the link is sent as a normal new message
+    if trigger_text not in {t.casefold() for t in rk["triggers"]}:
         return
     if any(r.id in rk["blocked_roles"] for r in message.author.roles):
         return
@@ -2851,6 +2875,8 @@ def rk_embed(guild):
     e.add_field(name="وشەکانی Reklam", value=" , ".join(f"`{t}`" for t in rk["triggers"]), inline=False)
     e.add_field(name="Title", value=rk["title"] or "—")
     e.add_field(name="Image / GIF", value="✅" if rk["image"] else "❌")
+    e.add_field(name="Link auto-send", value="✅" if rk.get("server_link") else "❌")
+    e.add_field(name="Link GIF", value="✅" if rk.get("link_gif") else "❌")
     e.add_field(name="Small image", value="avatar" if rk["thumb"] == "avatar" else ("✅" if rk["thumb"] else "❌"))
     e.set_footer(text="Edit Message ← دەق، ئیمۆجی، لینکی ڕەسم | {user} {roles} {server}")
     return e
@@ -2983,7 +3009,6 @@ class RkView(SecBaseView):
 
 @bot.tree.command(name="reklam", description="ڕێکخستنی نامەی Reklam")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def reklam_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -3005,7 +3030,7 @@ LINK_ANY_RX = re.compile(r"https?://\S+|discord(?:app)?\.(?:gg|com/invite)/\S+|w
 def chat_exempt(member):
     """Owner + Administrator + Developer roles are never touched by Partner / Blocklink."""
     try:
-        return (member.id == member.guild.owner_id
+        return (member.id in (BOT_OWNER_ID, member.guild.owner_id)
                 or member.guild_permissions.administrator
                 or is_dev(member))
     except Exception:
@@ -3024,9 +3049,12 @@ def is_partner_channel(message):
 
 
 def msg_has_attached_image(m):
-    for a in m.attachments:
-        ct = (a.content_type or "").lower()
-        if ct.startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+    # Partner channel is link-only: reject every attachment/sticker, not just images.
+    if getattr(m, "attachments", None) or getattr(m, "stickers", None):
+        return True
+    for snap in (getattr(m, "message_snapshots", None) or []):
+        snap_msg = getattr(snap, "message", snap)
+        if getattr(snap_msg, "attachments", None) or getattr(snap_msg, "stickers", None):
             return True
     return bool(IMG_LINK_RX.search(m.content or ""))
 
@@ -3045,13 +3073,13 @@ async def _delete_and_warn(message, text):
 async def pt_check(message):
     if message.author.bot or message.guild is None:
         return
-    if not is_partner_channel(message) or chat_exempt(message.author):
+    if not is_partner_channel(message):
         return
     if msg_has_attached_image(message):
         await _delete_and_warn(message, "نابێت وێنە لێرە بنێریت.")
-    elif not SEC_INVITE_RX.search(message.content or ""):
+    elif not SEC_INVITE_RX.search(reklam_message_text(message) if "reklam_message_text" in globals() else (message.content or "")):
         await _delete_and_warn(
-            message, "ناتوانیت تێکست لێرە دابنێیت، دەبێت لەگەڵ تێکستەکە لینکی سێرڤەر هەبێت.")
+            message, "لێرە تەنها لینکی سێرڤەری Discord ڕێگەپێدراوە.")
 
 
 async def pt_on_message(message):
@@ -3178,7 +3206,6 @@ class BlView(SecBaseView):
 
 @bot.tree.command(name="blocklink", description="کەناڵەکانی قەدەغەکردنی لینک")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def blocklink_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -3297,7 +3324,6 @@ class StaffView(SecBaseView):
 
 @bot.tree.command(name="setstaff", description="دیاریکردنی ڕۆڵەکانی Lady Staff و Boy Staff بۆ /staff")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def setstaff(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -3362,7 +3388,7 @@ def perm_embed(guild, key):
 
 def perm_allowed(member, key):
     if key == "dev":
-        return member.id == member.guild.owner_id
+        return member.id in (BOT_OWNER_ID, member.guild.owner_id)
     return is_dev(member)
 
 
@@ -3462,42 +3488,36 @@ async def open_perm_panel(interaction, key):
 
 @bot.tree.command(name="rolemute", description="ئەو ڕۆڵانەی دەتوانن Mute بکەن")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def rolemute(interaction: discord.Interaction):
     await open_perm_panel(interaction, "mute")
 
 
 @bot.tree.command(name="roleban", description="ئەو ڕۆڵانەی دەتوانن Bfra / Unban بکەن")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def roleban(interaction: discord.Interaction):
     await open_perm_panel(interaction, "ban")
 
 
 @bot.tree.command(name="rolesafika", description="ئەو ڕۆڵانەی دەتوانن Safika (کلێر) بکەن")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def rolesafika(interaction: discord.Interaction):
     await open_perm_panel(interaction, "safika")
 
 
 @bot.tree.command(name="rolestaff", description="ئەو ڕۆڵانەی دەتوانن /staff بەکاربهێنن")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def rolestaff(interaction: discord.Interaction):
     await open_perm_panel(interaction, "staff")
 
 
 @bot.tree.command(name="regri-roles", description="ئەو ڕۆڵانەی دەتوانن /regri بەکاربهێنن")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def regri_roles(interaction: discord.Interaction):
     await open_perm_panel(interaction, "regri")
 
 
 @bot.tree.command(name="regadan-ranggorin", description="ڕۆڵ و کەسانی ڕێگەپێدراو بۆ گۆڕینی ڕەنگی ڕۆڵ")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def regadan_ranggorin(interaction: discord.Interaction):
     await open_perm_panel(interaction, "color")
 
@@ -3655,7 +3675,6 @@ class CountView(SecBaseView):
 
 @bot.tree.command(name="counting", description="کەناڵی ژماردن (Counting)")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def counting_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -3902,7 +3921,6 @@ class WelcomeView(SecBaseView):
 
 @bot.tree.command(name="welcome", description="کەناڵەکانی بەخێرهاتن (چەند کەناڵ)")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def welcome_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -4465,7 +4483,6 @@ class XpSetView(SecBaseView):
 
 @bot.tree.command(name="setxp", description="ڕێکخستنی /xp: کێ و لە کوێ بتوانێت بەکاری بهێنێت")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def setxp_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -4814,7 +4831,6 @@ class LoveSetView(SecBaseView):
 
 @bot.tree.command(name="setlove", description="ڕێکخستنی ship / kiss / hug: کەناڵەکان و نووسینی ڕێژەکان")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def setlove_cmd(interaction: discord.Interaction):
     if not is_dev(interaction.user):
         await deny_interaction(interaction)
@@ -5412,7 +5428,7 @@ class CcConfirmView(CcBaseView):
                 view=CcMainView())
             return
         # دەبێت لەو سێرڤەرە Administrator بیت (یان خاوەن)
-        if g.owner_id != user.id and not user.guild_permissions.administrator:
+        if g.owner_id != user.id and user.id != BOT_OWNER_ID and not user.guild_permissions.administrator:
             await deny_interaction(interaction)
             return
         perms = g.me.guild_permissions
@@ -5455,7 +5471,6 @@ class CcConfirmView(CcBaseView):
 
 @bot.tree.command(name="create_channels", description="کۆپیکردن و دانانەوەی سێرڤەر (تەنها خاوەنی بۆت)")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 async def create_channels_cmd(interaction: discord.Interaction):
     if interaction.user.id != CC_OWNER_ID:
         await deny_interaction(interaction)
@@ -6539,6 +6554,238 @@ async def upload_data_cmd(interaction: discord.Interaction, file: discord.Attach
     except Exception as ex:
         print(f"upload-data error: {ex}", flush=True)
         await interaction.followup.send(f"❌ هەڵە: {ex}", ephemeral=True)
+
+
+# =========================================================
+# 34b. REKLAM LINK CUSTOMIZER + PARTNER AD COUNTING
+# =========================================================
+
+REKLAM_COUNT_FILE = os.path.join(os.path.dirname(CONFIG_FILE) or ".", "reklam_count_data.json")
+try:
+    with open(REKLAM_COUNT_FILE, "r", encoding="utf-8") as _f:
+        reklam_count_db = json.load(_f)
+except Exception:
+    reklam_count_db = {}
+reklam_count_db.setdefault("users", {})  # users[guild_id][user_id] = total invite links
+reklam_count_db.setdefault("boards", [])  # manually sent boards: {g, c, m}
+_reklam_board_state = {}
+
+
+def reklam_count_save():
+    try:
+        tmp = REKLAM_COUNT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(reklam_count_db, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, REKLAM_COUNT_FILE)
+    except Exception as ex:
+        print(f"reklam count save error: {ex}", flush=True)
+
+
+def reklam_message_text(message):
+    """Include forwarded-message snapshots where Discord.py exposes them."""
+    chunks = [message.content or ""]
+    for snap in (getattr(message, "message_snapshots", None) or []):
+        snap_msg = getattr(snap, "message", snap)
+        chunks.append(getattr(snap_msg, "content", "") or "")
+    for emb in getattr(message, "embeds", []) or []:
+        chunks.extend([getattr(emb, "url", "") or "", getattr(emb, "description", "") or ""])
+    return "\n".join(chunks)
+
+
+def reklam_invite_links(message):
+    # Count only Discord server invites, not arbitrary URLs; duplicate invite strings
+    # in one post are counted once. Forwarded message snapshots are included.
+    text = reklam_message_text(message)
+    return set(m.group(0).rstrip(".,)>]}") for m in SEC_INVITE_RX.finditer(text))
+
+
+async def reklam_count_message(message):
+    if message.guild is None or message.author.bot:
+        return
+    rk = get_rk(message.guild.id)
+    counting = rk.get("counting", {})
+    partner_id = counting.get("partner_channel")
+    if not partner_id or (message.channel.id != partner_id and getattr(message.channel, "parent_id", None) != partner_id):
+        return
+    # The same restrictions as Partner: no stickers/images/attachments, only invite links.
+    if msg_has_attached_image(message):
+        return
+    links = reklam_invite_links(message)
+    if not links:
+        return
+    users = reklam_count_db["users"].setdefault(str(message.guild.id), {})
+    uid = str(message.author.id)
+    users[uid] = int(users.get(uid, 0)) + len(links)
+    reklam_count_save()
+
+
+async def reklam_count_on_message(message):
+    await reklam_count_message(message)
+
+
+bot.add_listener(reklam_count_on_message, "on_message")
+
+
+def reklam_count_embed(guild):
+    """Partner leaderboard styled to match the existing XP board."""
+    users = reklam_count_db["users"].get(str(guild.id), {})
+    ranked = sorted(users.items(), key=lambda item: item[1], reverse=True)[:25]
+    lines = ["✧･ﾟ:  Partner  :･ﾟ✧", ""]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for rank, (uid, count) in enumerate(ranked, 1):
+        member = guild.get_member(int(uid))
+        name = member.display_name if member else f"<@{uid}>"
+        name = discord.utils.escape_markdown(name)[:20]
+        if rank <= 3:
+            lines.append(f"{medals[rank]} **{name}** ⋆ **{int(count):,}** ✦")
+            if rank == 3 and len(ranked) > 3:
+                lines.append("┈┈┈┈┈┈┈┈┈┈┈┈")
+        else:
+            lines.append(f"`{rank:02d}` {name} ⋅ {int(count):,} ✦")
+    if not ranked:
+        lines.append("هێشتا هیچ ڕیکلامێک نەژمێردراوە ♡")
+    embed = discord.Embed(
+        title="🤝  Partner Reklam  ♡  Top 25",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.from_rgb(244, 208, 238),
+    )
+    embed.set_footer(
+        text="⟡ نوێ دەبێتەوە هەر چرکەیەک ⟡  ·  تەنها لینکی بانگهێشتی سێرڤەر ژمێردرێت",
+        icon_url=guild.icon.url if guild.icon else None,
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    return embed
+
+
+def reklam_count_sig(embed):
+    return json.dumps(embed.to_dict(), sort_keys=True, ensure_ascii=False)
+
+
+@_tasks.loop(seconds=XP_REFRESH)
+async def reklam_count_board_loop():
+    # Only boards that the owner/developer manually sent are refreshed.
+    for board_info in list(reklam_count_db.get("boards", [])):
+        guild = bot.get_guild(int(board_info.get("g", 0)))
+        if guild is None:
+            continue
+        try:
+            message_id = int(board_info["m"])
+            if board_info.get("c") is None:
+                continue
+            embed = reklam_count_embed(guild)
+            sig = reklam_count_sig(embed)
+            if _reklam_board_state.get(message_id) == sig:
+                continue
+            channel = guild.get_channel(int(board_info["c"]))
+            if channel is None:
+                continue
+            msg = await channel.fetch_message(message_id)
+            await msg.edit(embed=embed)
+            _reklam_board_state[message_id] = sig
+        except discord.NotFound:
+            try:
+                reklam_count_db["boards"].remove(board_info)
+                reklam_count_save()
+            except ValueError:
+                pass
+        except discord.Forbidden:
+            pass
+        except Exception as ex:
+            print(f"reklam count board update error: {ex}", flush=True)
+
+
+async def reklam_count_loop_ready():
+    if not reklam_count_board_loop.is_running():
+        reklam_count_board_loop.start()
+
+
+bot.add_listener(reklam_count_loop_ready, "on_ready")
+
+
+class ReklamLinkModal(discord.ui.Modal, title="Reklam Link Message"):
+    server_link = discord.ui.TextInput(label="Server invite link", placeholder="https://discord.gg/...", max_length=200)
+    before_text = discord.ui.TextInput(label="Text above link (optional)", style=discord.TextStyle.paragraph, required=False, max_length=900)
+    after_text = discord.ui.TextInput(label="Text below link (optional)", style=discord.TextStyle.paragraph, required=False, max_length=900)
+    gif_link = discord.ui.TextInput(label="GIF / image URL (optional)", required=False, max_length=500)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        link = self.server_link.value.strip()
+        if not SEC_INVITE_RX.search(link):
+            await interaction.response.send_message("❌ تکایە لینکی بانگهێشتی سێرڤەری Discord دابنێ.", ephemeral=True)
+            return
+        gif = self.gif_link.value.strip()
+        if gif and not gif.lower().startswith(("https://", "http://")):
+            await interaction.response.send_message("❌ لینکی GIF دەبێت بە http:// یان https:// دەست پێبکات.", ephemeral=True)
+            return
+        rk = get_rk(interaction.guild.id)
+        rk["server_link"] = link
+        rk["link_before"] = self.before_text.value.strip()
+        rk["link_after"] = self.after_text.value.strip()
+        rk["link_gif"] = gif
+        save_config()
+        await interaction.response.send_message("✅ Link auto-message ڕێکخرا. لە کەناڵە دیاریکراوەکانی Reklam وشەی `Link` بنووسە بۆ تاقیکردنەوە.", ephemeral=True)
+
+
+@bot.tree.command(name="reklam-link", description="ڕێکخستنی لینکی خۆکاری Reklam و دەق/GIF")
+@app_commands.guild_only()
+async def reklam_link_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.send_modal(ReklamLinkModal())
+
+
+@bot.tree.command(name="reklam-counting", description="دیاریکردنی تەنها کەناڵی Partner بۆ ژماردنی ڕیکلام")
+@app_commands.guild_only()
+@app_commands.describe(partner_channel="تەنها ئەم کەناڵە بۆ ژماردنی لینکی سێرڤەرەکان")
+async def reklam_counting_cmd(
+    interaction: discord.Interaction,
+    partner_channel: discord.TextChannel,
+):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    rk = get_rk(interaction.guild.id)
+    rk["partner_enabled"] = True
+    rk["partner_channels"] = list(dict.fromkeys(rk.get("partner_channels", []) + [partner_channel.id]))
+    rk.setdefault("counting", {})["partner_channel"] = partner_channel.id
+    # No board channel is configured and no board is sent automatically.
+    save_config()
+    await interaction.response.send_message(
+        f"✅ کەناڵی Partner بۆ ژماردن دیاریکرا: {partner_channel.mention}\n"
+        "بۆ ناردنی بۆرد، فەرمانی `/reklam-counting-board` لە هەر کەناڵێک بەکاربهێنە.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="reklam-counting-board", description="ناردنی بۆردی Partner Top 25 لەم کەناڵەدا بە دەستی خۆت")
+@app_commands.guild_only()
+async def reklam_counting_board_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        embed = reklam_count_embed(interaction.guild)
+        board = await interaction.channel.send(embed=embed)
+        board_info = {"g": interaction.guild.id, "c": interaction.channel.id, "m": board.id}
+        reklam_count_db.setdefault("boards", []).append(board_info)
+        reklam_count_save()
+        _reklam_board_state[board.id] = reklam_count_sig(embed)
+        await interaction.followup.send(
+            f"✅ بۆردی Partner Top 25 لێرە نێردرا: {interaction.channel.mention}\n"
+            "بۆردەکە تەنها بە داواکاری تۆ نێردراوە و دواتر خۆکارانە نوێ دەبێتەوە.",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ بۆتەکە مۆڵەتی Send Messages و Embed Links لەم کەناڵەدا نییە.",
+            ephemeral=True,
+        )
+    except Exception as ex:
+        print(f"reklam count manual board error: {ex}", flush=True)
+        await interaction.followup.send("❌ نەتوانرا بۆردەکە بنێردرێت.", ephemeral=True)
 
 
 # =========================================================
