@@ -2765,9 +2765,24 @@ RK_MEDIA_URL_RX = re.compile(
     re.I)
 
 
-def rk_hide_media_links(text):
-    """GIF/image links typed in the Link text: Discord shows the media, the URL text itself is hidden."""
-    return RK_MEDIA_URL_RX.sub(lambda m: f"[\u200b]({m.group(0)})", text)
+def rk_link_messages(parts):
+    """Split the Link text at every GIF/image link, keeping the order you wrote it.
+    Text chunks stay normal messages; a GIF link goes alone in its own message so Discord
+    shows only the GIF (no link text)."""
+    out, buf = [], ""
+    for part in parts:
+        pos = 0
+        for m in RK_MEDIA_URL_RX.finditer(part):
+            buf += part[pos:m.start()]
+            if buf.strip():
+                out.append(buf.strip())
+            buf = ""
+            out.append(m.group(0))
+            pos = m.end()
+        buf += part[pos:] + "\n"
+    if buf.strip():
+        out.append(buf.strip())
+    return [x[:2000] for x in out]
 
 
 def get_rk(gid):
@@ -2841,10 +2856,10 @@ async def rk_on_message(message):
         mute_role = get_mute_role(g)
         if mute_role and mute_role in message.author.roles:
             return
-        parts = [rk_hide_media_links(x.strip()) for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
-        body = "\n".join(parts)[:2000]
+        parts = [x.strip() for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
         try:
-            await ch.send(body, allowed_mentions=discord.AllowedMentions.none())
+            for chunk in rk_link_messages(parts):
+                await ch.send(chunk, allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
             print(f"reklam link auto-send error: {e}", flush=True)
         return  # no reply/reference: the link is sent as a normal new message
