@@ -2760,6 +2760,16 @@ RK_DEFAULT_TRIGGERS = ["reklam", "ریکلام", "ڕیکلام"]
 RK_LINK_WORD_RX = re.compile(r"(?<!\w)(?:link(?!\w)|لینک|لينك)", re.I)
 
 
+RK_MEDIA_URL_RX = re.compile(
+    r"https?://(?:\S*\.(?:gif|png|jpe?g|webp|mp4)(?:\?\S*)?|(?:www\.)?(?:tenor\.com|giphy\.com|media\.giphy\.com|imgur\.com|i\.imgur\.com|media\.discordapp\.net|cdn\.discordapp\.com)\S*)",
+    re.I)
+
+
+def rk_hide_media_links(text):
+    """GIF/image links typed in the Link text: Discord shows the media, the URL text itself is hidden."""
+    return RK_MEDIA_URL_RX.sub(lambda m: f"[\u200b]({m.group(0)})", text)
+
+
 def get_rk(gid):
     rk = cfg(gid).setdefault("reklam", {})
     rk.setdefault("enabled", True)
@@ -2831,18 +2841,10 @@ async def rk_on_message(message):
         mute_role = get_mute_role(g)
         if mute_role and mute_role in message.author.roles:
             return
-        parts = [x.strip() for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
-        body = "\n".join(parts)
-        gif = (rk.get("link_gif") or "").strip()
+        parts = [rk_hide_media_links(x.strip()) for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
+        body = "\n".join(parts)[:2000]
         try:
-            if gif:
-                if not gif.lower().startswith(("https://", "http://")):
-                    return
-                em = discord.Embed(description=body, color=discord.Color.blurple())
-                em.set_image(url=gif)
-                await ch.send(embed=em, allowed_mentions=discord.AllowedMentions.none())
-            else:
-                await ch.send(body, allowed_mentions=discord.AllowedMentions.none())
+            await ch.send(body, allowed_mentions=discord.AllowedMentions.none())
         except Exception as e:
             print(f"reklam link auto-send error: {e}", flush=True)
         return  # no reply/reference: the link is sent as a normal new message
@@ -2882,7 +2884,6 @@ def rk_embed(guild):
     e.add_field(name="Title", value=rk["title"] or "—")
     e.add_field(name="Image / GIF", value="✅" if rk["image"] else "❌")
     e.add_field(name="Link auto-send", value="✅" if rk.get("server_link") else "❌")
-    e.add_field(name="Link GIF", value="✅" if rk.get("link_gif") else "❌")
     e.add_field(name="Small image", value="avatar" if rk["thumb"] == "avatar" else ("✅" if rk["thumb"] else "❌"))
     e.set_footer(text="Edit Message ← دەق، ئیمۆجی، لینکی ڕەسم | {user} {roles} {server}")
     return e
@@ -6762,15 +6763,12 @@ class ReklamLinkModal(discord.ui.Modal, title="Reklam Link Message"):
             label="Server invite link", placeholder="https://discord.gg/...",
             default=rk.get("server_link") or None, max_length=200)
         self.before_text = discord.ui.TextInput(
-            label="Text above link (optional)", style=discord.TextStyle.paragraph,
+            label="Text above link (GIF link allowed)", style=discord.TextStyle.paragraph,
             default=rk.get("link_before") or None, required=False, max_length=900)
         self.after_text = discord.ui.TextInput(
-            label="Text below link (optional)", style=discord.TextStyle.paragraph,
+            label="Text below link (GIF link allowed)", style=discord.TextStyle.paragraph,
             default=rk.get("link_after") or None, required=False, max_length=900)
-        self.gif_link = discord.ui.TextInput(
-            label="GIF / image URL (optional)",
-            default=rk.get("link_gif") or None, required=False, max_length=500)
-        for item in (self.server_link, self.before_text, self.after_text, self.gif_link):
+        for item in (self.server_link, self.before_text, self.after_text):
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -6778,15 +6776,11 @@ class ReklamLinkModal(discord.ui.Modal, title="Reklam Link Message"):
         if not SEC_INVITE_RX.search(link):
             await interaction.response.send_message("❌ تکایە لینکی بانگهێشتی سێرڤەری Discord دابنێ.", ephemeral=True)
             return
-        gif = self.gif_link.value.strip()
-        if gif and not gif.lower().startswith(("https://", "http://")):
-            await interaction.response.send_message("❌ لینکی GIF دەبێت بە http:// یان https:// دەست پێبکات.", ephemeral=True)
-            return
         rk = get_rk(interaction.guild.id)
         rk["server_link"] = link
         rk["link_before"] = self.before_text.value.strip()
         rk["link_after"] = self.after_text.value.strip()
-        rk["link_gif"] = gif
+        rk["link_gif"] = ""
         save_config()
         await interaction.response.send_message("✅ Link auto-message ڕێکخرا. لە کەناڵە دیاریکراوەکانی Reklam هەر نامەیەک وشەی `link` یان `لینک` تیابێت، بۆتەکە ئەم نامەیە دەنێرێت.", ephemeral=True)
 
