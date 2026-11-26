@@ -2757,6 +2757,7 @@ async def autoreact_cmd(interaction: discord.Interaction):
 # =========================================================
 
 RK_DEFAULT_TRIGGERS = ["reklam", "ریکلام", "ڕیکلام"]
+RK_LINK_WORD_RX = re.compile(r"(?<!\w)(?:link(?!\w)|لینک|لينك)", re.I)
 
 
 def get_rk(gid):
@@ -2820,11 +2821,15 @@ async def rk_on_message(message):
     if ch.id not in rk["channels"] and getattr(ch, "parent_id", None) not in rk["channels"]:
         return
     trigger_text = (message.content or "").strip().casefold()
-    if trigger_text == "link":
+    content = message.content or ""
+    invite = (rk.get("server_link") or "").strip()
+    # Any message containing the word link / لینک (any case, with other words too) -> send the server link.
+    # A message that already contains a real URL/invite is ignored.
+    if invite and RK_LINK_WORD_RX.search(content) and not LINK_ANY_RX.search(content):
         if any(r.id in rk["blocked_roles"] for r in message.author.roles):
             return
-        invite = (rk.get("server_link") or "").strip()
-        if not invite:
+        mute_role = get_mute_role(g)
+        if mute_role and mute_role in message.author.roles:
             return
         parts = [x.strip() for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
         body = "\n".join(parts)
@@ -3106,8 +3111,26 @@ def rkp_embed(guild):
         description="\n".join(f"<#{c}>" for c in rk["partner_channels"])[:3000] or "❌ هیچ کەناڵێک دیاری نەکراوە",
         color=discord.Color.green() if rk["partner_enabled"] else discord.Color.red()
     )
-    e.set_footer(text="تەنها نامەی لەگەڵ لینکی سێرڤەر ڕێگەپێدراوە | وێنە قەدەغەیە")
+    board_ch = (rk.get("counting") or {}).get("board_channel")
+    e.add_field(name="📊 کەناڵی بۆردی Top 25",
+                value=f"<#{board_ch}>" if board_ch else "❌ دیاری نەکراوە (لە هەمان چاتی ئێستا دەنێردرێت)",
+                inline=False)
+    e.set_footer(text="تەنها نامەی لەگەڵ لینکی سێرڤەر ڕێگەپێدراوە | وێنە قەدەغەیە | هەموو کەسێک دەژمێردرێت")
     return e
+
+
+class RkBoardChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, row=2):
+        super().__init__(
+            placeholder="کەناڵی ناردنی بۆردی Top 25 هەڵبژێرە...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            min_values=1, max_values=1, row=row)
+
+    async def callback(self, interaction):
+        rk = get_rk(self.view.guild.id)
+        rk.setdefault("counting", {})["board_channel"] = self.values[0].id
+        save_config()
+        await panel_edit(interaction, self.view, "rkp")
 
 
 class RkPartnerView(SecBaseView):
@@ -3115,6 +3138,7 @@ class RkPartnerView(SecBaseView):
         super().__init__(guild, author_id)
         rk = get_rk(guild.id)
         self.add_item(PanelChannelSelect("rkp", row=0))
+        self.add_item(RkBoardChannelSelect(row=2))
         self.toggle.label = "Partner: ON" if rk["partner_enabled"] else "Partner: OFF"
         self.toggle.style = discord.ButtonStyle.success if rk["partner_enabled"] else discord.ButtonStyle.danger
 
@@ -3134,6 +3158,29 @@ class RkPartnerView(SecBaseView):
     @discord.ui.button(label="‹ Back", style=discord.ButtonStyle.secondary, row=1)
     async def back(self, interaction, button):
         await panel_edit(interaction, self, "rk")
+
+    @discord.ui.button(label="Send Board", style=discord.ButtonStyle.success, row=3)
+    async def send_board_btn(self, interaction, button):
+        rk = get_rk(self.guild.id)
+        target_id = (rk.get("counting") or {}).get("board_channel")
+        target = self.guild.get_channel(int(target_id)) if target_id else None
+        if target is None:
+            target = interaction.channel
+        try:
+            embed = reklam_count_embed(self.guild)
+            board = await target.send(embed=embed)
+            reklam_count_db.setdefault("boards", []).append(
+                {"g": self.guild.id, "c": target.id, "m": board.id})
+            reklam_count_save()
+            _reklam_board_state[board.id] = reklam_count_sig(embed)
+            await interaction.response.send_message(
+                f"✅ بۆردی Top 25 نێردرا بۆ {target.mention} و خۆکارانە نوێ دەبێتەوە.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ بۆتەکە مۆڵەتی Send Messages و Embed Links لەو کەناڵەدا نییە.", ephemeral=True)
+        except Exception as ex:
+            print(f"reklam board send error: {ex}", flush=True)
+            await interaction.response.send_message("❌ نەتوانرا بۆردەکە بنێردرێت.", ephemeral=True)
 
 
 # ---------------------------------------------------------
@@ -6607,13 +6654,9 @@ def reklam_invite_links(message):
 async def reklam_count_message(message):
     if message.guild is None or message.author.bot:
         return
-    # Same channels as pt_check (every Partner channel), and the same rules for EVERYONE:
-    # owner, administrator, developer and normal members are all counted (no exemption).
-    rk = get_rk(message.guild.id)
-    partner_id = rk.get("counting", {}).get("partner_channel")
-    in_counting_ch = bool(partner_id) and (
-        message.channel.id == partner_id or getattr(message.channel, "parent_id", None) == partner_id)
-    if not (is_partner_channel(message) or in_counting_ch):
+    # Counting follows the Partner channels chosen in /reklam -> Partner (same as pt_check).
+    # Owner, administrator, developer and normal members are ALL counted (no exemption).
+    if not is_partner_channel(message):
         return
     # The same restrictions as Partner: no stickers/images/attachments, only invite links.
     if msg_has_attached_image(message):
@@ -6745,55 +6788,7 @@ class ReklamLinkModal(discord.ui.Modal, title="Reklam Link Message"):
         rk["link_after"] = self.after_text.value.strip()
         rk["link_gif"] = gif
         save_config()
-        await interaction.response.send_message("✅ Link auto-message ڕێکخرا. لە کەناڵە دیاریکراوەکانی Reklam وشەی `Link` بنووسە بۆ تاقیکردنەوە.", ephemeral=True)
-
-
-@bot.tree.command(name="reklam-counting", description="دیاریکردنی کەناڵی Partner بۆ ژماردن و ناردنی بۆردی Top 25")
-@app_commands.guild_only()
-@app_commands.describe(
-    partner_channel="تەنها ئەم کەناڵە بۆ ژماردنی لینکی سێرڤەرەکان (ئارەزوومەندانە)",
-    send_board="بۆردی Partner Top 25 لەم کەناڵەی ئێستادا بنێرە (ئارەزوومەندانە)",
-)
-async def reklam_counting_cmd(
-    interaction: discord.Interaction,
-    partner_channel: Optional[discord.TextChannel] = None,
-    send_board: bool = False,
-):
-    if not is_dev(interaction.user):
-        await deny_interaction(interaction)
-        return
-    if partner_channel is None and not send_board:
-        await interaction.response.send_message(
-            "ℹ️ کەناڵی Partner دیاری بکە، یان `send_board: True` هەڵبژێرە بۆ ناردنی بۆرد.",
-            ephemeral=True,
-        )
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    replies = []
-    if partner_channel is not None:
-        rk = get_rk(interaction.guild.id)
-        rk["partner_enabled"] = True
-        rk["partner_channels"] = list(dict.fromkeys(rk.get("partner_channels", []) + [partner_channel.id]))
-        rk.setdefault("counting", {})["partner_channel"] = partner_channel.id
-        save_config()
-        replies.append(f"✅ کەناڵی Partner بۆ ژماردن دیاریکرا: {partner_channel.mention}")
-    if send_board:
-        try:
-            embed = reklam_count_embed(interaction.guild)
-            board = await interaction.channel.send(embed=embed)
-            reklam_count_db.setdefault("boards", []).append(
-                {"g": interaction.guild.id, "c": interaction.channel.id, "m": board.id})
-            reklam_count_save()
-            _reklam_board_state[board.id] = reklam_count_sig(embed)
-            replies.append(
-                f"✅ بۆردی Partner Top 25 لێرە نێردرا: {interaction.channel.mention}\n"
-                "بۆردەکە تەنها بە داواکاری تۆ نێردراوە و دواتر خۆکارانە نوێ دەبێتەوە.")
-        except discord.Forbidden:
-            replies.append("❌ بۆتەکە مۆڵەتی Send Messages و Embed Links لەم کەناڵەدا نییە.")
-        except Exception as ex:
-            print(f"reklam count manual board error: {ex}", flush=True)
-            replies.append("❌ نەتوانرا بۆردەکە بنێردرێت.")
-    await interaction.followup.send("\n".join(replies), ephemeral=True)
+        await interaction.response.send_message("✅ Link auto-message ڕێکخرا. لە کەناڵە دیاریکراوەکانی Reklam هەر نامەیەک وشەی `link` یان `لینک` تیابێت، بۆتەکە ئەم نامەیە دەنێرێت.", ephemeral=True)
 
 
 # =========================================================
