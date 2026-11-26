@@ -2785,6 +2785,56 @@ def rk_link_messages(parts):
     return [x[:2000] for x in out]
 
 
+async def rk_send_link(ch, parts):
+    """Send the Link message as ONE message: text, GIF, text in exactly the order written.
+    Uses Discord's newer layout messages (discord.py 2.6+); older versions fall back to 2 messages."""
+    no_mentions = discord.AllowedMentions.none()
+    chunks = rk_link_messages(parts)
+    try:
+        items, files, texts = [], [], []
+
+        def flush_text():
+            if texts:
+                items.append(discord.ui.TextDisplay("\n".join(texts)[:3900]))
+                texts.clear()
+
+        for chunk in chunks:
+            if RK_MEDIA_URL_RX.fullmatch(chunk) and len(files) < 10:
+                path = await rk_media_get(chunk)
+                if path:
+                    name = f"reklam{len(files)+1}" + os.path.splitext(path)[1]
+                    files.append(discord.File(path, filename=name))
+                    flush_text()
+                    items.append(discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{name}")))
+                    continue
+            texts.append(chunk)
+        flush_text()
+        view = discord.ui.LayoutView(timeout=None)
+        for it in items:
+            view.add_item(it)
+        await ch.send(view=view, files=files, allowed_mentions=no_mentions)
+        return
+    except Exception as e:
+        print(f"reklam link layout-send failed, using fallback: {e}", flush=True)
+    # fallback: a message ends at each GIF (Discord shows files under the text of their own message)
+    try:
+        texts = []
+        for chunk in chunks:
+            if RK_MEDIA_URL_RX.fullmatch(chunk):
+                path = await rk_media_get(chunk)
+                if path:
+                    await ch.send("\n".join(texts)[:2000] or None,
+                                  file=discord.File(path, filename="reklam" + os.path.splitext(path)[1]),
+                                  allowed_mentions=no_mentions)
+                    texts = []
+                    continue
+            texts.append(chunk)
+        if texts:
+            await ch.send("\n".join(texts)[:2000], allowed_mentions=no_mentions)
+    except Exception as e:
+        print(f"reklam link auto-send error: {e}", flush=True)
+
+
 def get_rk(gid):
     rk = cfg(gid).setdefault("reklam", {})
     rk.setdefault("enabled", True)
@@ -2857,24 +2907,7 @@ async def rk_on_message(message):
         if mute_role and mute_role in message.author.roles:
             return
         parts = [x.strip() for x in (rk.get("link_before"), invite, rk.get("link_after")) if x and x.strip()]
-        try:
-            # Discord always shows an attached file UNDER the text of its own message, so a message
-            # ends at each GIF: [text written before the GIF + the GIF] then the rest in the next message.
-            texts, no_mentions = [], discord.AllowedMentions.none()
-            for chunk in rk_link_messages(parts):
-                if RK_MEDIA_URL_RX.fullmatch(chunk):
-                    path = await rk_media_get(chunk)   # re-upload the GIF itself (no link text)
-                    if path:
-                        await ch.send("\n".join(texts)[:2000] or None,
-                                      file=discord.File(path, filename="reklam" + os.path.splitext(path)[1]),
-                                      allowed_mentions=no_mentions)
-                        texts = []
-                        continue
-                texts.append(chunk)
-            if texts:
-                await ch.send("\n".join(texts)[:2000], allowed_mentions=no_mentions)
-        except Exception as e:
-            print(f"reklam link auto-send error: {e}", flush=True)
+        await rk_send_link(ch, parts)
         return  # no reply/reference: the link is sent as a normal new message
     if trigger_text not in {t.casefold() for t in rk["triggers"]}:
         return
