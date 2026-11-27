@@ -118,6 +118,11 @@ def cfg(guild_id):
     d.setdefault("xp_channels", [])    # channels where /xp works (empty = everywhere)
     d.setdefault("love_channels", [])  # channels where ship/kiss/hug/pat work (empty = everywhere)
     d.setdefault("love_texts", {})     # custom status texts: {"9": "...", "self": "..."} (empty = defaults)
+    d.setdefault("mod_words", {})      # /change-comod : custom trigger words {"mute": "wss"}
+    d.setdefault("mod_texts", {})      # /change-comod : custom replies {"mute": "... {user}"}
+    d.setdefault("custom_cmds", [])    # /add-commands : custom commands
+    d.setdefault("love_gifs", {})      # /love-gifs : {"kiss": {"ff": [urls], ...}}
+    d.setdefault("love_gender", {"f": [], "m": []})
     return d
 
 
@@ -1044,9 +1049,13 @@ async def on_message(message):
     parts = content.split()
     command = ""
 
+    _wm = mod_word_map(message.guild.id)   # وشەی mute/unmute/bfra/unban (دیفەڵت یان گۆڕدراو بە /change-comod)
     for part in parts:
         clean_part = part.lower().strip()
-        if clean_part in COMMAND_WORDS:
+        if clean_part in _wm:
+            command = _wm[clean_part]
+            break
+        if clean_part in COMMAND_WORDS and clean_part not in MOD_KEYS:
             command = clean_part
             break
         if clean_part.startswith("safika") and clean_part[6:].isdigit():
@@ -1055,6 +1064,8 @@ async def on_message(message):
 
     if not command and parts:
         command = parts[0].lower()
+        if command in MOD_KEYS:      # وشە دیفەڵتەکە گۆڕدراوە، کار ناکات
+            command = ""
 
     # ---------------- SAFIKA ----------------
     # (ئەمە تەنها کۆماندێکە کە نامەکان دەسڕێتەوە - چونکە کارەکەی ئەوەیە)
@@ -1120,7 +1131,7 @@ async def on_message(message):
                     channel=message.channel, via="Bot command"
                 )
             # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
-            await message.channel.send(f"damt daxaa {target.mention}")
+            await message.channel.send(mod_text(message.guild.id, "mute", target.mention))
         except discord.Forbidden:
             await message.channel.send(
                 "❌ بۆتەکە مۆڵەتی Manage Roles ی نییە، یان ڕۆڵی بۆتەکە لە **Roles** دا لە خوار ڕۆڵی Muted یان ئەو کەسەیە. ڕۆڵی بۆتەکە بەرز بکەرەوە.",
@@ -1155,9 +1166,7 @@ async def on_message(message):
                     channel=message.channel, via="Bot command"
                 )
             # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
-            await message.channel.send(
-                f"xwa xerm bnwse dllm basha aqllba amjara {target.mention}"
-            )
+            await message.channel.send(mod_text(message.guild.id, "unmute", target.mention))
         except discord.Forbidden:
             await message.channel.send(
                 "❌ بۆتەکە مۆڵەتی Manage Roles ی نییە، یان ڕۆڵەکەی لە خوار ڕۆڵی Muted ە.",
@@ -1197,7 +1206,7 @@ async def on_message(message):
             # چاتی کەسە باندکراوەکە ناسڕدرێتەوە
             await target.ban(reason=f"Banned by {message.author}", delete_message_seconds=0)
             # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
-            await message.channel.send(f"Frenraa✈️ {target.mention}")
+            await message.channel.send(mod_text(message.guild.id, "bfra", target.mention))
         except discord.Forbidden:
             await message.channel.send(
                 "❌ بۆتەکە مۆڵەتی Ban Members ی نییە، یان ڕۆڵی بۆتەکە لە خوار ڕۆڵی ئەو کەسەیە. ڕۆڵی بۆتەکە بەرز بکەرەوە.",
@@ -1230,7 +1239,7 @@ async def on_message(message):
             mark_cmd_ban("unban", user_id, message.author.mention)
             await message.guild.unban(user)
             # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
-            await message.channel.send("✅ Unban کرا.")
+            await message.channel.send(mod_text(message.guild.id, "unban", f"<@{user_id}>"))
         except discord.NotFound:
             await message.channel.send("❌ ئەم کەسە لە لیستی Ban دا نییە.", delete_after=5)
         except discord.Forbidden:
@@ -4920,6 +4929,14 @@ async def love_on_message(message):
         if is_love:
             a, b = (targets[0], targets[1]) if len(targets) >= 2 else (me, targets[0])
             embed = love_embed(a, b, message.guild.id)
+            p = 100 if a.id == b.id else love_percent(a.id, b.id)
+            f = await ship_file(a, b, p)
+            if f:
+                embed.set_thumbnail(url=None)
+                embed.set_image(url="attachment://ship.png")
+                await message.reply(embed=embed, file=f, mention_author=False,
+                                    allowed_mentions=discord.AllowedMentions.none())
+                return
         else:
             b = targets[0]
             if b.id == me.id:
@@ -4927,6 +4944,13 @@ async def love_on_message(message):
                 return
             n = love_count(message.guild.id, me.id, b.id, action)
             embed = action_embed(me, b, action, n)
+            gif = await love_pick_gif(message.guild, me, b, action)
+            inline = gif_embed_apply(embed, gif)
+            await message.reply(embed=embed, mention_author=False,
+                                allowed_mentions=discord.AllowedMentions.none())
+            if gif and not inline:
+                await message.channel.send(gif)
+            return
         await message.reply(embed=embed, mention_author=False,
                             allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
@@ -7200,6 +7224,654 @@ class ReklamLinkModal(discord.ui.Modal, title="Reklam Link Message"):
             msg += (f"\n⚠ {bad} لینکی GIF/وێنە نەتوانرا دابەزێنرێت (لەوانەیە بەسەرچووبێت، یان فایلەکە "
                     "گەورەیە، یان لینکی ڕاستەوخۆی وێنە نییە). لینکەکە وەک خۆی دەنێردرێت.")
         await interaction.followup.send(msg, ephemeral=True)
+
+
+# =========================================================
+# 29e. /change-comod  +  /add-commands  +  /love-gifs  +  glass-heart ship
+# =========================================================
+# - /change-comod : گۆڕینی وشەی کۆماندەکان (mute / unmute / bfra / unban) و نووسینی وەڵامەکەیان
+#                   {user} = mention ی کەسەکە
+# - /add-commands : دروستکردنی کۆماندی تایبەت (وەڵام، پێدانی ڕۆڵ، لابردنی ڕۆڵ، گۆڕینی ناو)
+#                   {user} = نووسەر ، {target} = کەسی تاگکراو/ڕیپلەکراو ، {nick} = ناوی نوێ ، {role} = ناوی ڕۆڵ
+# - /love-gifs    : گیفەکانی kiss / hug / pat بەپێی ڕۆڵی کچ/کور + ڕۆڵی کچ و کور
+# - ship          : وێنەی دڵی شووشەیی سوور لە نێوان وێنەی هەردووکیان (پێویستی بە Pillow هەیە)
+# فایلی requirements.txt: Pillow  بنووسە
+
+import io as _io
+
+try:
+    import math as _math
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageChops
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
+    print("⚠ Pillow نییە - ship بێ وێنە کار دەکات. لە requirements.txt بنووسە: Pillow", flush=True)
+
+MOD_KEYS = ("mute", "unmute", "bfra", "unban")
+MOD_DEFAULTS = {
+    "mute":   ("mute",   "damt daxaa {user}"),
+    "unmute": ("unmute", "xwa xerm bnwse dllm basha aqllba amjara {user}"),
+    "bfra":   ("bfra",   "Frenraa✈️ {user}"),
+    "unban":  ("unban",  "✅ Unban کرا."),
+}
+
+
+def mod_word_map(gid):
+    w = cfg(gid)["mod_words"]
+    return {(w.get(k) or MOD_DEFAULTS[k][0]).lower(): k for k in MOD_KEYS}
+
+
+def mod_text(gid, key, user=""):
+    t = cfg(gid)["mod_texts"].get(key) or MOD_DEFAULTS[key][1]
+    return t.replace("{user}", user)
+
+
+def comod_embed(guild):
+    c = cfg(guild.id)
+    e = discord.Embed(title="⚙️ /change-comod", color=discord.Color.blurple(),
+                      description="کۆماندێک هەڵبژێرە بۆ گۆڕینی وشەکەی و وەڵامەکەی.\n`{user}` = کەسەکە (mention)")
+    for k in MOD_KEYS:
+        word = c["mod_words"].get(k) or MOD_DEFAULTS[k][0]
+        text = c["mod_texts"].get(k) or MOD_DEFAULTS[k][1]
+        e.add_field(name=f"{k.upper()}  ←  `{word}`", value=text[:200], inline=False)
+    return e
+
+
+class ComodModal(discord.ui.Modal):
+    def __init__(self, guild, author_id, key):
+        super().__init__(title=f"گۆڕینی {key}"[:45])
+        self.guild, self.author_id, self.key = guild, author_id, key
+        c = cfg(guild.id)
+        self.word = discord.ui.TextInput(label="وشەی کۆماندەکە (بەتاڵ = دیفەڵت)", required=False, max_length=30,
+                                         default=c["mod_words"].get(key) or MOD_DEFAULTS[key][0])
+        self.text = discord.ui.TextInput(label="وەڵامی بۆتەکە ({user} = کەسەکە)", required=False, max_length=300,
+                                         style=discord.TextStyle.paragraph,
+                                         default=c["mod_texts"].get(key) or MOD_DEFAULTS[key][1])
+        self.add_item(self.word); self.add_item(self.text)
+
+    async def on_submit(self, interaction):
+        if not is_dev(interaction.user):
+            await deny_interaction(interaction); return
+        c = cfg(self.guild.id)
+        w = self.word.value.strip().lower().split()[0] if self.word.value.strip() else ""
+        taken = {k2: (c["mod_words"].get(k2) or MOD_DEFAULTS[k2][0]).lower() for k2 in MOD_KEYS if k2 != self.key}
+        if w and (w in taken.values() or w in COMMAND_WORDS and w != MOD_DEFAULTS[self.key][0]
+                  or any(x["name"].lower() == w for x in c["custom_cmds"])):
+            await interaction.response.send_message("❌ ئەم وشەیە پێشتر بەکارهاتووە.", ephemeral=True); return
+        if w and w != MOD_DEFAULTS[self.key][0]:
+            c["mod_words"][self.key] = w
+        else:
+            c["mod_words"].pop(self.key, None)
+        t = self.text.value.strip()
+        if t and t != MOD_DEFAULTS[self.key][1]:
+            c["mod_texts"][self.key] = t
+        else:
+            c["mod_texts"].pop(self.key, None)
+        save_config()
+        await interaction.response.edit_message(embed=comod_embed(self.guild), view=ComodView(self.guild, self.author_id))
+
+
+class ComodSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder="✏️ کۆماندێک هەڵبژێرە...", row=0,
+                         options=[discord.SelectOption(label=k.upper(), value=k) for k in MOD_KEYS])
+
+    async def callback(self, interaction):
+        await interaction.response.send_modal(ComodModal(self.view.guild, self.view.author_id, self.values[0]))
+
+
+class ComodView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        self.add_item(ComodSelect())
+
+    @discord.ui.button(label="Reset", style=discord.ButtonStyle.danger, row=1)
+    async def reset_btn(self, interaction, button):
+        c = cfg(self.guild.id); c["mod_words"].clear(); c["mod_texts"].clear(); save_config()
+        await interaction.response.edit_message(embed=comod_embed(self.guild), view=ComodView(self.guild, self.author_id))
+
+
+@bot.tree.command(name="change-comod", description="گۆڕینی وشە و وەڵامی mute / unmute / bfra / unban")
+@app_commands.guild_only()
+async def change_comod_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction); return
+    await interaction.response.send_message(embed=comod_embed(interaction.guild),
+                                            view=ComodView(interaction.guild, interaction.user.id), ephemeral=True)
+
+
+# ---------------------------------------------------------
+# /add-commands : کۆماندی تایبەت
+# ---------------------------------------------------------
+CC_ACTIONS = {"give": "پێدانی ڕۆڵ", "remove": "لابردنی ڕۆڵ", "text": "تەنها وەڵام"}
+
+
+def cc2_get(gid, name):
+    for c in cfg(gid)["custom_cmds"]:
+        if c["name"].lower() == name.lower():
+            return c
+    return None
+
+
+def cc2_embed(guild, name=None):
+    cmds = cfg(guild.id)["custom_cmds"]
+    if name is None:
+        e = discord.Embed(title="🧩 /add-commands", color=discord.Color.blurple(),
+                          description="➕ بۆ زیادکردنی کۆماندی نوێ.\nلە لیستەکە هەڵبژێرە بۆ دەستکاری/سڕینەوە.\n\n"
+                                      + ("\n".join(f"• `{c['name']}` — {CC_ACTIONS.get(c['action'])}" for c in cmds)[:3500] or "هیچ کۆماندێک نییە"))
+        return e
+    c = cc2_get(guild.id, name)
+    e = discord.Embed(title=f"🧩 {c['name']}", color=discord.Color.blurple())
+    e.add_field(name="کار", value=CC_ACTIONS.get(c["action"], "-"))
+    e.add_field(name="ڕۆڵ", value=f"<@&{c['role_id']}>" if c.get("role_id") else "❌ دیارینەکراوە")
+    e.add_field(name="گۆڕینی ناو", value="✅" if c.get("set_nick") else "❌")
+    who = " ".join(f"<@&{r}>" for r in c["allowed"]) or "🌍 هەموو کەس"
+    e.add_field(name="کێ بەکاری دەهێنێت", value=who[:1000], inline=False)
+    e.add_field(name="وەڵام", value=(c.get("reply") or "-")[:1000], inline=False)
+    e.set_footer(text="{user} {target} {nick} {role}   |   نموونە:  " + c["name"] + " @کەس" + (" ناوی نوێ" if c.get("set_nick") else ""))
+    return e
+
+
+class CmdModal(discord.ui.Modal):
+    def __init__(self, guild, author_id, existing=None):
+        super().__init__(title="کۆماندی نوێ" if not existing else "دەستکاری کۆماند")
+        self.guild, self.author_id, self.old = guild, author_id, existing
+        self.name = discord.ui.TextInput(label="ناوی کۆماند (بۆ نموونە: +lady یان slaw)", max_length=30,
+                                         default=existing["name"] if existing else None)
+        self.action = discord.ui.TextInput(label="کار: give / remove / text", max_length=6,
+                                           default=existing["action"] if existing else "text")
+        self.reply = discord.ui.TextInput(label="وەڵام ({user} {target} {nick} {role})", required=False, max_length=1500,
+                                          style=discord.TextStyle.paragraph, default=(existing or {}).get("reply") or None)
+        self.nick = discord.ui.TextInput(label="ناوی نوێ لە دوای mention دابنێت؟ yes / no", max_length=3, required=False,
+                                         default="yes" if (existing or {}).get("set_nick") else "no")
+        for i in (self.name, self.action, self.reply, self.nick):
+            self.add_item(i)
+
+    async def on_submit(self, interaction):
+        if not is_dev(interaction.user):
+            await deny_interaction(interaction); return
+        c = cfg(self.guild.id)
+        name = self.name.value.strip().lower()
+        act = self.action.value.strip().lower()
+        if act not in CC_ACTIONS:
+            await interaction.response.send_message("❌ کار دەبێت یەکێک بێت لە: give / remove / text", ephemeral=True); return
+        low_words = set(COMMAND_WORDS) | set(LOVE_WORDS) | set(_LOVE_ACTION_WORDS) | set(mod_word_map(self.guild.id))
+        if name in low_words:
+            await interaction.response.send_message("❌ ئەم ناوە بۆ کۆمانێکی تری بۆتەکەیە.", ephemeral=True); return
+        dup = cc2_get(self.guild.id, name)
+        if dup and dup is not self.old:
+            await interaction.response.send_message("❌ ئەم ناوە پێشتر هەیە.", ephemeral=True); return
+        if len(c["custom_cmds"]) >= 100 and not self.old:
+            await interaction.response.send_message("❌ زیاتر لە 100 کۆماند نابێت.", ephemeral=True); return
+        rec = self.old or {"role_id": None, "allowed": []}
+        rec.update(name=name, action=act, reply=self.reply.value.strip(),
+                   set_nick=self.nick.value.strip().lower() in ("yes", "y", "به", "بەڵێ"))
+        if not self.old:
+            c["custom_cmds"].append(rec)
+        save_config()
+        await interaction.response.send_message(embed=cc2_embed(self.guild, name),
+                                                view=CmdEditView(self.guild, self.author_id, name), ephemeral=True)
+
+
+class CmdPickSelect(discord.ui.Select):
+    def __init__(self, guild):
+        cmds = cfg(guild.id)["custom_cmds"][:25]
+        super().__init__(placeholder="✏️ کۆماندێک هەڵبژێرە بۆ دەستکاری / سڕینەوە...", row=0,
+                         options=[discord.SelectOption(label=c["name"][:100], value=c["name"][:100],
+                                                       description=CC_ACTIONS.get(c["action"])) for c in cmds])
+
+    async def callback(self, interaction):
+        n = self.values[0]
+        await interaction.response.send_message(embed=cc2_embed(self.view.guild, n),
+                                                view=CmdEditView(self.view.guild, self.view.author_id, n), ephemeral=True)
+
+
+class CmdListView(SecBaseView):
+    def __init__(self, guild, author_id):
+        super().__init__(guild, author_id)
+        if cfg(guild.id)["custom_cmds"]:
+            self.add_item(CmdPickSelect(guild))
+
+    @discord.ui.button(label="کۆماندی نوێ", emoji="➕", style=discord.ButtonStyle.success, row=1)
+    async def add_btn(self, interaction, button):
+        await interaction.response.send_modal(CmdModal(self.guild, self.author_id))
+
+
+class CmdRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, name):
+        super().__init__(placeholder="🎭 ڕۆڵی پێدان / لابردن...", min_values=1, max_values=1, row=0)
+        self.cname = name
+
+    async def callback(self, interaction):
+        cc2_get(self.view.guild.id, self.cname)["role_id"] = self.values[0].id
+        save_config()
+        await interaction.response.edit_message(embed=cc2_embed(self.view.guild, self.cname),
+                                                view=CmdEditView(self.view.guild, self.view.author_id, self.cname))
+
+
+class CmdAllowedSelect(discord.ui.RoleSelect):
+    def __init__(self, name):
+        super().__init__(placeholder="👥 کام ڕۆڵ بتوانێت بەکاری بهێنێت...", min_values=1, max_values=25, row=1)
+        self.cname = name
+
+    async def callback(self, interaction):
+        cc2_get(self.view.guild.id, self.cname)["allowed"] = [r.id for r in self.values]
+        save_config()
+        await interaction.response.edit_message(embed=cc2_embed(self.view.guild, self.cname),
+                                                view=CmdEditView(self.view.guild, self.view.author_id, self.cname))
+
+
+class CmdEditView(SecBaseView):
+    def __init__(self, guild, author_id, name):
+        super().__init__(guild, author_id)
+        self.cname = name
+        self.add_item(CmdRoleSelect(name))
+        self.add_item(CmdAllowedSelect(name))
+
+    @discord.ui.button(label="هەموو کەس", emoji="🌍", style=discord.ButtonStyle.secondary, row=2)
+    async def everyone(self, interaction, button):
+        cc2_get(self.guild.id, self.cname)["allowed"] = []; save_config()
+        await interaction.response.edit_message(embed=cc2_embed(self.guild, self.cname),
+                                                view=CmdEditView(self.guild, self.author_id, self.cname))
+
+    @discord.ui.button(label="دەستکاری", emoji="✏️", style=discord.ButtonStyle.primary, row=2)
+    async def edit_btn(self, interaction, button):
+        await interaction.response.send_modal(CmdModal(self.guild, self.author_id, cc2_get(self.guild.id, self.cname)))
+
+    @discord.ui.button(label="سڕینەوە", emoji="🗑", style=discord.ButtonStyle.danger, row=2)
+    async def del_btn(self, interaction, button):
+        cmds = cfg(self.guild.id)["custom_cmds"]
+        cmds[:] = [c for c in cmds if c["name"].lower() != self.cname.lower()]; save_config()
+        await interaction.response.edit_message(content="🗑 سڕایەوە.", embed=None, view=None)
+
+
+@bot.tree.command(name="add-commands", description="دروستکردنی کۆماندی تایبەت (وەڵام، پێدانی ڕۆڵ، گۆڕینی ناو ...)")
+@app_commands.guild_only()
+async def add_commands_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction); return
+    await interaction.response.send_message(embed=cc2_embed(interaction.guild),
+                                            view=CmdListView(interaction.guild, interaction.user.id), ephemeral=True)
+
+
+def _cc2_fmt(text, **kw):
+    for k, v in kw.items():
+        text = text.replace("{" + k + "}", str(v))
+    return text
+
+
+async def custom_cmd_on_message(message):
+    if message.author.bot or message.guild is None or not message.content:
+        return
+    cmds = cfg(message.guild.id)["custom_cmds"]
+    if not cmds:
+        return
+    raw = message.content.strip()
+    low = raw.lower()
+    hit = None
+    for c in sorted(cmds, key=lambda x: -len(x["name"])):
+        t = c["name"].lower()
+        if low == t or low.startswith(t + " "):
+            hit = c; break
+    if not hit:
+        return
+    me = message.author
+    if hit["allowed"] and not is_dev(me) and not any(r.id in hit["allowed"] for r in me.roles):
+        await deny_message(message); return
+
+    rest = raw[len(hit["name"]):].strip()
+    target = None
+    for u in message.mentions:
+        if not u.bot:
+            target = u; break
+    if target is None and message.reference and message.reference.message_id:
+        try:
+            ref = message.reference.resolved
+            if ref is None or isinstance(ref, discord.DeletedReferencedMessage):
+                ref = await message.channel.fetch_message(message.reference.message_id)
+            if ref and not ref.author.bot:
+                target = message.guild.get_member(ref.author.id) or ref.author
+        except Exception:
+            pass
+    needs_target = hit["action"] in ("give", "remove") or "{target}" in (hit.get("reply") or "")
+    if needs_target and target is None:
+        await message.channel.send(f"{me.mention} کەسێک تاگ بکە یان ڕیپلەی بکە: `{hit['name']} @user`", delete_after=6)
+        return
+    nick = re.sub(r"<@!?\d+>", "", rest).strip()
+    role = message.guild.get_role(hit["role_id"]) if hit.get("role_id") else None
+    try:
+        if hit["action"] in ("give", "remove"):
+            if role is None:
+                await message.channel.send("❌ ڕۆڵی ئەم کۆمانە دیاری نەکراوە (/add-commands).", delete_after=8); return
+            if not isinstance(target, discord.Member):
+                return
+            top_me = message.guild.me.top_role
+            if role >= top_me or role.managed:
+                await message.channel.send("❌ ڕۆڵی بۆتەکە لە خوار ئەم ڕۆڵەیە، بەرزی بکەرەوە.", delete_after=8); return
+            if not is_dev(me) and not me.guild_permissions.administrator and role >= me.top_role:
+                await message.channel.send("❌ ناتوانیت ڕۆڵێک بدەیت کە لە ڕۆڵی خۆت بەرزترە.", delete_after=8); return
+            mark_cmd_role_give(target.id, me.mention, "Custom command")
+            if hit["action"] == "give":
+                await target.add_roles(role, reason=f"{hit['name']} by {me}")
+            else:
+                await target.remove_roles(role, reason=f"{hit['name']} by {me}")
+            if hit.get("set_nick") and nick and hit["action"] == "give":
+                try:
+                    await target.edit(nick=nick[:32], reason=f"{hit['name']} by {me}")
+                except Exception:
+                    pass
+        text = _cc2_fmt(hit.get("reply") or ("✅ {target}" if hit["action"] != "text" else ""),
+                        user=me.mention, target=target.mention if target else "", nick=nick,
+                        role=role.name if role else "")
+        if text:
+            await message.channel.send(text, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+    except discord.Forbidden:
+        await message.channel.send("❌ بۆتەکە مۆڵەتی Manage Roles / Nicknames ی نییە.", delete_after=8)
+    except Exception as e:
+        print(f"custom cmd error: {e}", flush=True)
+
+
+bot.add_listener(custom_cmd_on_message, "on_message")
+
+
+# ---------------------------------------------------------
+# GIFs بۆ kiss / hug / pat  (ff = کچ+کچ ، mm = کور+کور ، mf = تێکەڵ ، any = هەموو)
+# ---------------------------------------------------------
+import aiohttp
+
+GIF_PAIRS = {"ff": "کچ + کچ", "mm": "کور + کور", "mf": "کچ + کور / تێکەڵ", "any": "هەموو جۆرێک"}
+GIF_ACTIONS = ("kiss", "hug", "pat")
+_GIF_APIS = (
+    ("https://nekos.best/api/v2/{a}", lambda j: j["results"][0]["url"]),
+    ("https://api.waifu.pics/sfw/{a}", lambda j: j["url"]),
+)
+_DIRECT_RX = re.compile(r"\.(?:gif|png|jpe?g|webp)(?:\?\S*)?$|media\.tenor\.com/|media\d*\.giphy\.com/|i\.imgur\.com/", re.I)
+
+
+def love_gender(member):
+    c = cfg(member.guild.id)
+    ids = {r.id for r in member.roles}
+    g = c.setdefault("love_gender", {"f": [], "m": []})
+    f = set(g["f"]) or set(get_staff_roles(member.guild.id, "staff1"))
+    m = set(g["m"]) or set(get_staff_roles(member.guild.id, "staff2"))
+    if ids & f and not ids & m:
+        return "f"
+    if ids & m and not ids & f:
+        return "m"
+    return None
+
+
+def love_pair(a, b):
+    ga, gb = love_gender(a), love_gender(b)
+    if ga == gb == "f":
+        return "ff"
+    if ga == gb == "m":
+        return "mm"
+    return "mf"
+
+
+async def love_fetch_api(action):
+    apis = list(_GIF_APIS); random.shuffle(apis)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as s:
+            for url, pick in apis:
+                try:
+                    async with s.get(url.format(a=action)) as r:
+                        if r.status == 200:
+                            return pick(await r.json(content_type=None))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+async def love_pick_gif(guild, a, b, action):
+    c = cfg(guild.id)
+    pools = c["love_gifs"].get(action, {})
+    pair = love_pair(a, b)
+    own = pools.get(pair) or pools.get("any") or []
+    use_api = c.get("love_api", True)
+    # ئەگەر گیفی تایبەت هەبێت: زۆربەی جار ئەوە (٧٠٪)، ئەگەرنا API ی نوێ
+    if own and (not use_api or random.random() < 0.7):
+        return random.choice(own)
+    if use_api:
+        g = await love_fetch_api(action)
+        if g:
+            return g
+    return random.choice(own) if own else None
+
+
+def gif_embed_apply(embed, gif):
+    """True = گیفەکە لە ناو embed دانرا؛ False = دەبێت وەک لینک بنێردرێت"""
+    if gif and _DIRECT_RX.search(gif):
+        embed.set_image(url=gif)
+        return True
+    return False
+
+
+def lovegifs_embed(guild, action, pair):
+    c = cfg(guild.id)
+    g = c["love_gifs"]
+    lines = []
+    for act in GIF_ACTIONS:
+        lines.append(f"**{act}**  " + "  ".join(f"`{p}` {len(g.get(act, {}).get(p, []))}" for p in GIF_PAIRS))
+    e = discord.Embed(title="🎞 /love-gifs", color=discord.Color.from_rgb(250, 205, 235),
+                      description="\n".join(lines))
+    e.add_field(name="ئێستا دەستکاری:", value=f"**{action}** ⋅ **{GIF_PAIRS[pair]}**", inline=False)
+    e.add_field(name="API (گیفی نوێ لە ئینتەرنێتەوە)", value="🟢 چالاک" if c.get("love_api", True) else "🔴 ناچالاک")
+    gen = c.setdefault("love_gender", {"f": [], "m": []})
+    e.add_field(name="ڕۆڵی کچ", value=" ".join(f"<@&{r}>" for r in gen["f"]) or "Lady Staff (دیفەڵت)")
+    e.add_field(name="ڕۆڵی کور", value=" ".join(f"<@&{r}>" for r in gen["m"]) or "Boy Staff (دیفەڵت)")
+    e.set_footer(text="لینکی ڕاستەوخۆی .gif باشترینە | ٥٠٠ گیف بۆ هەر جۆرێک")
+    return e
+
+
+class LoveGifAddModal(discord.ui.Modal):
+    def __init__(self, view):
+        super().__init__(title=f"گیف زیاد بکە: {view.action} / {view.pair}"[:45])
+        self.v = view
+        self.links = discord.ui.TextInput(label="لینکەکان (هەر لینکێک لە دێڕێک)", style=discord.TextStyle.paragraph,
+                                          max_length=4000)
+        self.add_item(self.links)
+
+    async def on_submit(self, interaction):
+        if not is_dev(interaction.user):
+            await deny_interaction(interaction); return
+        urls = re.findall(r"https?://\S+", self.links.value)
+        pool = cfg(self.v.guild.id)["love_gifs"].setdefault(self.v.action, {}).setdefault(self.v.pair, [])
+        n = 0
+        for u in urls:
+            if u not in pool and len(pool) < 500:
+                pool.append(u); n += 1
+        save_config()
+        await interaction.response.edit_message(embed=lovegifs_embed(self.v.guild, self.v.action, self.v.pair),
+                                                view=LoveGifView(self.v.guild, self.v.author_id, self.v.action, self.v.pair))
+
+
+class LoveGifActionSelect(discord.ui.Select):
+    def __init__(self, cur):
+        super().__init__(placeholder="کار: kiss / hug / pat", row=0,
+                         options=[discord.SelectOption(label=a, value=a, default=a == cur) for a in GIF_ACTIONS])
+
+    async def callback(self, i):
+        v = self.view
+        await i.response.edit_message(embed=lovegifs_embed(v.guild, self.values[0], v.pair),
+                                      view=LoveGifView(v.guild, v.author_id, self.values[0], v.pair))
+
+
+class LoveGifPairSelect(discord.ui.Select):
+    def __init__(self, cur):
+        super().__init__(placeholder="جۆر: کچ+کچ / کور+کور / تێکەڵ", row=1,
+                         options=[discord.SelectOption(label=f"{k} — {t}", value=k, default=k == cur) for k, t in GIF_PAIRS.items()])
+
+    async def callback(self, i):
+        v = self.view
+        await i.response.edit_message(embed=lovegifs_embed(v.guild, v.action, self.values[0]),
+                                      view=LoveGifView(v.guild, v.author_id, v.action, self.values[0]))
+
+
+class LoveGenderSelect(discord.ui.RoleSelect):
+    def __init__(self, key, row):
+        super().__init__(placeholder="👧 ڕۆڵەکانی کچ..." if key == "f" else "👦 ڕۆڵەکانی کور...",
+                         min_values=1, max_values=25, row=row)
+        self.key = key
+
+    async def callback(self, i):
+        v = self.view
+        cfg(v.guild.id).setdefault("love_gender", {"f": [], "m": []})[self.key] = [r.id for r in self.values]
+        save_config()
+        await i.response.edit_message(embed=lovegifs_embed(v.guild, v.action, v.pair),
+                                      view=LoveGifView(v.guild, v.author_id, v.action, v.pair))
+
+
+class LoveGifView(SecBaseView):
+    def __init__(self, guild, author_id, action="kiss", pair="ff"):
+        super().__init__(guild, author_id)
+        self.action, self.pair = action, pair
+        self.add_item(LoveGifActionSelect(action)); self.add_item(LoveGifPairSelect(pair))
+        self.add_item(LoveGenderSelect("f", 2)); self.add_item(LoveGenderSelect("m", 3))
+
+    @discord.ui.button(label="زیادکردنی گیف", emoji="➕", style=discord.ButtonStyle.success, row=4)
+    async def add_btn(self, i, b):
+        await i.response.send_modal(LoveGifAddModal(self))
+
+    @discord.ui.button(label="پاککردنەوەی ئەم جۆرە", emoji="🗑", style=discord.ButtonStyle.danger, row=4)
+    async def clear_btn(self, i, b):
+        cfg(self.guild.id)["love_gifs"].setdefault(self.action, {})[self.pair] = []; save_config()
+        await i.response.edit_message(embed=lovegifs_embed(self.guild, self.action, self.pair),
+                                      view=LoveGifView(self.guild, self.author_id, self.action, self.pair))
+
+    @discord.ui.button(label="API on/off", emoji="🌐", style=discord.ButtonStyle.secondary, row=4)
+    async def api_btn(self, i, b):
+        c = cfg(self.guild.id); c["love_api"] = not c.get("love_api", True); save_config()
+        await i.response.edit_message(embed=lovegifs_embed(self.guild, self.action, self.pair),
+                                      view=LoveGifView(self.guild, self.author_id, self.action, self.pair))
+
+
+@bot.tree.command(name="love-gifs", description="گیفەکانی kiss / hug / pat و ڕۆڵی کچ و کور")
+@app_commands.guild_only()
+async def love_gifs_cmd(interaction: discord.Interaction):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction); return
+    await interaction.response.send_message(embed=lovegifs_embed(interaction.guild, "kiss", "ff"),
+                                            view=LoveGifView(interaction.guild, interaction.user.id), ephemeral=True)
+
+
+# ---------------------------------------------------------
+# Ship: وێنەی دڵی شووشەیی سوور لە نێوان وێنەی هەردووکیان
+# ---------------------------------------------------------
+_SHIP_FONTS = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "DejaVuSans-Bold.ttf",
+               "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+               "arialbd.ttf", "Arial Bold.ttf"]
+
+
+def _ship_font(size):
+    for p in _SHIP_FONTS:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _heart_mask(w, h, pad):
+    pts = []
+    for i in range(361):
+        t = _math.radians(i)
+        pts.append((16 * _math.sin(t) ** 3,
+                    -(13 * _math.cos(t) - 5 * _math.cos(2 * t) - 2 * _math.cos(3 * t) - _math.cos(4 * t))))
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    s = min((w - 2 * pad) / (max(xs) - min(xs)), (h - 2 * pad) / (max(ys) - min(ys)))
+    mx = (max(xs) + min(xs)) / 2; my = (max(ys) + min(ys)) / 2
+    m = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(m).polygon([(w / 2 + (x - mx) * s, h / 2 + (y - my) * s) for x, y in pts], fill=255)
+    return m
+
+
+def _glass_heart(size, text):
+    S = 4; W = size * S
+    mask = _heart_mask(W, W, int(W * 0.06))
+    body = Image.new("RGBA", (W, W)); px = ImageDraw.Draw(body)
+    for y in range(W):
+        k = y / W
+        px.line([(0, y), (W, y)], fill=(max(int(235 - 85 * k), 0), max(int(30 - 22 * k), 0), max(int(60 - 30 * k), 0), 225))
+    glow = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([W * 0.2, W * 0.12, W * 0.7, W * 0.62], fill=(255, 110, 140, 120))
+    body = Image.alpha_composite(body, glow.filter(ImageFilter.GaussianBlur(W * 0.07)))
+    inner = mask.filter(ImageFilter.MinFilter(int(W * 0.035) | 1))
+    rim = ImageChops.subtract(mask, inner).filter(ImageFilter.GaussianBlur(W * 0.004))
+    rim_img = Image.new("RGBA", (W, W), (255, 200, 215, 0)); rim_img.putalpha(rim.point(lambda v: int(v * 0.75)))
+    body = Image.alpha_composite(body, rim_img)
+    shine = Image.new("RGBA", (W, W), (0, 0, 0, 0)); d = ImageDraw.Draw(shine)
+    d.ellipse([W * 0.17, W * 0.16, W * 0.47, W * 0.36], fill=(255, 255, 255, 150))
+    d.ellipse([W * 0.54, W * 0.17, W * 0.60, W * 0.215], fill=(255, 255, 255, 190))
+    d.ellipse([W * 0.30, W * 0.70, W * 0.70, W * 0.84], fill=(255, 150, 170, 70))
+    body = Image.alpha_composite(body, shine.filter(ImageFilter.GaussianBlur(W * 0.012)))
+    body.putalpha(ImageChops.multiply(body.getchannel("A"), mask))
+    f = _ship_font(int(W * (0.25 if len(text) <= 3 else 0.2)))
+    bb = ImageDraw.Draw(body).textbbox((0, 0), text, font=f)
+    tx = (W - (bb[2] - bb[0])) / 2 - bb[0]; ty = W * 0.43 - (bb[3] - bb[1]) / 2 - bb[1]
+    sh = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    ImageDraw.Draw(sh).text((tx, ty + W * 0.012), text, font=f, fill=(90, 0, 20, 150))
+    body = Image.alpha_composite(body, sh.filter(ImageFilter.GaussianBlur(W * 0.008)))
+    ImageDraw.Draw(body).text((tx, ty), text, font=f, fill=(255, 255, 255, 255))
+    return body.resize((size, size), Image.LANCZOS)
+
+
+def _ship_circle(img_bytes, d, ring=8):
+    S = 3
+    im = Image.open(_io.BytesIO(img_bytes)).convert("RGBA").resize((d * S, d * S), Image.LANCZOS)
+    m = Image.new("L", (d * S, d * S), 0); ImageDraw.Draw(m).ellipse([0, 0, d * S - 1, d * S - 1], fill=255)
+    out = Image.new("RGBA", (d * S, d * S), (0, 0, 0, 0)); out.paste(im, (0, 0), m)
+    rm = Image.new("L", (d * S, d * S), 0)
+    ImageDraw.Draw(rm).ellipse([0, 0, d * S - 1, d * S - 1], outline=255, width=ring * S)
+    ring_img = Image.new("RGBA", (d * S, d * S), (255, 255, 255, 235)); ring_img.putalpha(rm)
+    return Image.alpha_composite(out, ring_img).resize((d, d), Image.LANCZOS)
+
+
+def make_ship_png(a_bytes, b_bytes, percent):
+    W, H = 1000, 400
+    bg = Image.new("RGBA", (W, H)); px = ImageDraw.Draw(bg)
+    for x in range(W):
+        k = x / W
+        px.line([(x, 0), (x, H)], fill=(int(48 + 30 * k), int(20 + 8 * k), int(62 - 10 * k), 255))
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([300, 40, 700, 380], fill=(255, 60, 110, 110))
+    bg = Image.alpha_composite(bg, glow.filter(ImageFilter.GaussianBlur(70)))
+    D = 310
+    for img_bytes, cx in ((a_bytes, 185), (b_bytes, 815)):
+        sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(sh).ellipse([cx - D // 2, H // 2 - D // 2 + 12, cx + D // 2, H // 2 + D // 2 + 12], fill=(0, 0, 0, 140))
+        bg = Image.alpha_composite(bg, sh.filter(ImageFilter.GaussianBlur(14)))
+        bg.alpha_composite(_ship_circle(img_bytes, D), (cx - D // 2, H // 2 - D // 2))
+    hs = 330
+    heart = _glass_heart(hs, f"{percent}%")
+    shadow = Image.new("RGBA", heart.size, (60, 0, 20, 255)); shadow.putalpha(heart.getchannel("A").point(lambda v: int(v * 0.55)))
+    hsh = Image.new("RGBA", (W, H), (0, 0, 0, 0)); hsh.alpha_composite(shadow, (W // 2 - hs // 2, H // 2 - hs // 2 + 14))
+    bg = Image.alpha_composite(bg, hsh.filter(ImageFilter.GaussianBlur(16)))
+    bg.alpha_composite(heart, (W // 2 - hs // 2, H // 2 - hs // 2 - 6))
+    rm = Image.new("L", (W, H), 0); ImageDraw.Draw(rm).rounded_rectangle([0, 0, W - 1, H - 1], 36, fill=255)
+    bg.putalpha(rm)
+    out = _io.BytesIO(); bg.save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+
+async def ship_file(a, b, percent):
+    """discord.File یان None ئەگەر Pillow نەبوو"""
+    if not PIL_OK:
+        return None
+    try:
+        ab = await a.display_avatar.replace(size=256, format="png").read()
+        bb = await b.display_avatar.replace(size=256, format="png").read()
+        png = await asyncio.to_thread(make_ship_png, ab, bb, percent)
+        return discord.File(_io.BytesIO(png), filename="ship.png")
+    except Exception as e:
+        print(f"ship image error: {e}", flush=True)
+        return None
 
 
 # =========================================================
