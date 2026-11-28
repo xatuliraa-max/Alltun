@@ -5045,11 +5045,19 @@ async def love_on_message(message):
             n = love_count(message.guild.id, me.id, b.id, action)
             embed = action_embed(me, b, action, n)
             gif = await love_pick_gif(message.guild, me, b, action)
-            gif = await resolve_gif_url(gif)
-            inline = gif_embed_apply(embed, gif)
+            direct = await resolve_gif_url(gif)
+            gfile = await fetch_gif_file(direct)
+            if gfile is None and direct != gif:
+                config.get("_tenor_cache", {}).pop(gif, None)      # bad saved link -> read it again next time
+            if gfile:
+                embed.set_image(url=f"attachment://{gfile.filename}")
+                await message.reply(embed=embed, file=gfile, mention_author=False,
+                                    allowed_mentions=discord.AllowedMentions.none())
+                return
+            # fallback: show the embed, then the plain link (Discord plays it itself)
             await message.reply(embed=embed, mention_author=False,
                                 allowed_mentions=discord.AllowedMentions.none())
-            if gif and not inline:
+            if gif:
                 await message.channel.send(gif)
             return
         await message.reply(embed=embed, mention_author=False,
@@ -7940,6 +7948,29 @@ async def resolve_gif_url(url):
     except Exception as e:
         print(f"tenor resolve error: {e}", flush=True)
     return url
+
+
+async def fetch_gif_file(url):
+    """Downloads the gif and returns it as an attachment, so it ALWAYS shows inside the embed
+    (Discord sometimes refuses to load Tenor / Giphy links by itself). None = could not download."""
+    if not url or not _DIRECT_RX.search(url):
+        return None
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12),
+                                         headers={"User-Agent": "Mozilla/5.0"}) as sess:
+            async with sess.get(url) as r:
+                if r.status != 200:
+                    print(f"gif download failed ({r.status}): {url}", flush=True)
+                    return None
+                data = await r.read()
+        if not data or len(data) > 7_500_000:
+            print(f"gif empty or too big: {url}", flush=True)
+            return None
+        m = re.search(r"\.(gif|png|jpe?g|webp)(?:\?|$)", url, re.I)
+        return discord.File(_io.BytesIO(data), filename=f"love.{m.group(1).lower() if m else 'gif'}")
+    except Exception as e:
+        print(f"gif download error: {e} | {url}", flush=True)
+        return None
 
 
 def gif_embed_apply(embed, gif):
