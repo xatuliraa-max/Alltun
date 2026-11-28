@@ -102,6 +102,7 @@ def cfg(guild_id):
     d.setdefault("welcome_image", None)  # image / gif link shown under the welcome text
     d.setdefault("dev_roles", [])      # developer roles (full control like owner)
     d.setdefault("mute_role", None)    # role given on mute (set with /setmuterole)
+    d.setdefault("timed_mutes", {})    # user_id -> unix time when the timed mute ends
     d.setdefault("autorole", None)     # OLD single autorole (migrated into autoroles)
     d.setdefault("autoroles", [])      # roles given automatically to new members (/autorole)
     if d.get("autorole"):
@@ -1008,16 +1009,106 @@ async def on_message_edit(before, after):
 COMMAND_WORDS = ["safika", "mute", "unmute", "bfra", "unban", "lock", "unlock"]
 
 
-def parse_safika_amount(parts):
-    """Safika 1 / safika10 / safika ٥ / هەر شێوازێک"""
-    for p in parts:
-        pl = p.lower().strip()
-        if pl.startswith("safika") and pl[6:].isdigit():
-            return int(pl[6:])
-    for p in parts:
-        if p.strip().isdigit():
-            return int(p.strip())
+_MENTION_RX = re.compile(r"^<@!?(\d+)>$")
+_ID_RX = re.compile(r"^\d{15,22}$")
+_DUR_RX = re.compile(
+    r"^(\d{1,6})(s|sec|secs|second|seconds|m|min|mins|minute|minutes|"
+    r"h|hr|hrs|hour|hours|d|day|days|w|week|weeks)$", re.I)
+_DUR_MULT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+MAX_MUTE_SECONDS = 365 * 86400
+
+
+def parse_duration(token):
+    """'6h' / '30m' / '2d' -> (seconds, '6h')   |   None if it is not a duration"""
+    m = _DUR_RX.match(token.strip())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)[0].lower()
+    secs = n * _DUR_MULT[unit]
+    if n < 1 or secs > MAX_MUTE_SECONDS:
+        return None
+    return secs, f"{n}{unit}"
+
+
+def parse_mod_command(content, wm):
+    """STRICT command parser.
+
+    The message must contain ONLY the command word, plus mentions / ids
+    (and a duration for mute).  Any other word -> not a command at all.
+        mute @k          mute @k 6h        mute            (reply)   mute 30m (reply)
+        unmute @k        bfra @k           unban 1234567890123456
+        safika 10        safika10          lock              unlock
+    Returns None or a dict(command, ids, amount, seconds, label).
+    """
+    ids, rest = [], []
+    for t in content.split():
+        m = _MENTION_RX.match(t)
+        if m:
+            ids.append(int(m.group(1)))
+        elif _ID_RX.match(t):
+            ids.append(int(t))
+        else:
+            rest.append(t.lower())
+    if not rest:
+        return None
+
+    info = {"command": None, "ids": ids, "amount": None, "seconds": None, "label": None}
+    joined = " ".join(rest)
+
+    # --- safika / lock / unlock : nothing else allowed (no mentions) ---
+    if not ids:
+        if rest[0] == "safika" and len(rest) <= 2 and (len(rest) == 1 or rest[1].isdigit()):
+            info["command"] = "safika"
+            info["amount"] = int(rest[1]) if len(rest) == 2 else None
+            return info
+        if len(rest) == 1 and rest[0].startswith("safika") and rest[0][6:].isdigit():
+            info["command"] = "safika"
+            info["amount"] = int(rest[0][6:])
+            return info
+        if joined in ("lock", "unlock") and joined not in wm:
+            info["command"] = joined
+            return info
+
+    # --- mute / unmute / bfra / unban (words can be changed with /change-comod) ---
+    if joined in wm:
+        info["command"] = wm[joined]
+        return info
+    if len(rest) >= 2:
+        dur = parse_duration(rest[-1])
+        if dur and wm.get(" ".join(rest[:-1])) == "mute":
+            info["command"] = "mute"
+            info["seconds"], info["label"] = dur
+            return info
     return None
+
+
+async def resolve_mod_target(message, info):
+    target = await get_target_member(message)
+    if target:
+        return target
+    for uid in info["ids"]:
+        if uid == bot.user.id:
+            continue
+        m = message.guild.get_member(uid)
+        if m is None:
+            try:
+                m = await message.guild.fetch_member(uid)
+            except Exception:
+                m = None
+        if m:
+            return m
+    return None
+
+
+# ---- timed mute: end times are saved in config, so they survive restarts ----
+def set_timed_mute(guild_id, user_id, end_ts):
+    cfg(guild_id)["timed_mutes"][str(user_id)] = end_ts
+    save_config()
+
+
+def clear_timed_mute(guild_id, user_id):
+    if cfg(guild_id)["timed_mutes"].pop(str(user_id), None) is not None:
+        save_config()
 
 
 @bot.event
@@ -1046,26 +1137,13 @@ async def on_message(message):
     if content.startswith("!!"):   # TTS (ElevenLabs) - هیچ کۆمانێک لێرە کار ناکات
         return
 
+    # STRICT: only the exact command word (+ mention / id / duration) counts.
+    # "mute ladawa", "Unmuteee", "safika please" ... are normal chat, nothing happens.
+    info = parse_mod_command(content, mod_word_map(message.guild.id))
+    if info is None:
+        return
+    command = info["command"]
     parts = content.split()
-    command = ""
-
-    _wm = mod_word_map(message.guild.id)   # وشەی mute/unmute/bfra/unban (دیفەڵت یان گۆڕدراو بە /change-comod)
-    for part in parts:
-        clean_part = part.lower().strip()
-        if clean_part in _wm:
-            command = _wm[clean_part]
-            break
-        if clean_part in COMMAND_WORDS and clean_part not in MOD_KEYS:
-            command = clean_part
-            break
-        if clean_part.startswith("safika") and clean_part[6:].isdigit():
-            command = "safika"
-            break
-
-    if not command and parts:
-        command = parts[0].lower()
-        if command in MOD_KEYS:      # وشە دیفەڵتەکە گۆڕدراوە، کار ناکات
-            command = ""
 
     # ---------------- SAFIKA ----------------
     # (ئەمە تەنها کۆماندێکە کە نامەکان دەسڕێتەوە - چونکە کارەکەی ئەوەیە)
@@ -1075,7 +1153,7 @@ async def on_message(message):
                 await deny_message(message)
             return
 
-        amount = parse_safika_amount(parts)
+        amount = info["amount"]
 
         if amount is None or amount < 1:
             await message.channel.send("❌ وەک: `safika 10`", delete_after=5)
@@ -1105,10 +1183,10 @@ async def on_message(message):
                 await deny_message(message)
             return
 
-        target = await get_target_member(message)
+        target = await resolve_mod_target(message, info)
         if not target:
             await message.channel.send(
-                "❌ کەسەکە تاگ بکە یان ڕیپلەی بکە: `mute @user`", delete_after=5
+                "❌ کەسەکە تاگ بکە یان ڕیپلەی بکە: `mute @user` یان `mute @user 6h`", delete_after=5
             )
             return
 
@@ -1130,8 +1208,14 @@ async def on_message(message):
                     message.guild, target, message.author.mention, True,
                     channel=message.channel, via="Bot command"
                 )
-            # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
-            await message.channel.send(mod_text(message.guild.id, "mute", target.mention))
+            # ماوە: mute @k 6h  -> دوای ٦ کاتژمێر خۆی unmute دەبێت
+            reply_text = mod_text(message.guild.id, "mute", target.mention)
+            if info["seconds"]:
+                set_timed_mute(message.guild.id, target.id, time.time() + info["seconds"])
+                reply_text = f"{reply_text} {info['label']}"
+            else:
+                clear_timed_mute(message.guild.id, target.id)
+            await message.channel.send(reply_text)
         except discord.Forbidden:
             await message.channel.send(
                 "❌ بۆتەکە مۆڵەتی Manage Roles ی نییە، یان ڕۆڵی بۆتەکە لە **Roles** دا لە خوار ڕۆڵی Muted یان ئەو کەسەیە. ڕۆڵی بۆتەکە بەرز بکەرەوە.",
@@ -1149,7 +1233,7 @@ async def on_message(message):
                 await deny_message(message)
             return
 
-        target = await get_target_member(message)
+        target = await resolve_mod_target(message, info)
         if not target:
             await message.channel.send(
                 "❌ کەسەکە تاگ بکە یان ڕیپلەی بکە: `unmute @user`", delete_after=5
@@ -1165,7 +1249,7 @@ async def on_message(message):
                     message.guild, target, message.author.mention, False,
                     channel=message.channel, via="Bot command"
                 )
-            # نامەی تۆ و نامەی بۆتەکە هەردووکیان دەمێننەوە (هیچ دیلیتێک نییە)
+            clear_timed_mute(message.guild.id, target.id)
             await message.channel.send(mod_text(message.guild.id, "unmute", target.mention))
         except discord.Forbidden:
             await message.channel.send(
@@ -1184,7 +1268,7 @@ async def on_message(message):
                 await deny_message(message)
             return
 
-        target = await get_target_member(message)
+        target = await resolve_mod_target(message, info)
         if not target:
             await message.channel.send(
                 "❌ کەسەکە تاگ بکە یان ڕیپلەی بکە: `bfra @user`", delete_after=5
@@ -1224,11 +1308,7 @@ async def on_message(message):
                 await deny_message(message)
             return
 
-        user_id = None
-        for p in parts:
-            if p.strip().isdigit() and len(p.strip()) >= 15:
-                user_id = int(p.strip())
-                break
+        user_id = info["ids"][0] if info["ids"] else None
 
         if user_id is None:
             await message.channel.send("❌ وەک: `unban 123456789012345678`", delete_after=5)
@@ -4751,28 +4831,28 @@ LOVE_ACTIONS = {
     "kiss": {
         "words": ["kiss", "mach"],
         "emoji": "💋",
-        "title": "ماچ",
+        "title": "Kiss",
         "color": (255, 205, 222),
         "lines": [
-            "ماچێکی ناسک لەسەر ڕوومەت 🤍",
-            "ماچێکی بچووک و بێدەنگ ✨",
-            "ماچێک وەک پەپولەیەک نیشتەوە 🦋",
-            "ماچێکی شیرین و شەرمنانە 🌷",
+            "A soft kiss on the cheek 🤍",
+            "A tiny, quiet kiss ✨",
+            "A kiss landed like a butterfly 🦋",
+            "A sweet and shy kiss 🌷",
         ],
-        "count": "جار ماچی کردووە",
+        "count": "kisses",
     },
     "hug": {
         "words": ["hug", "bawesh"],
         "emoji": "🫶",
-        "title": "باوەش",
+        "title": "Hug",
         "color": (224, 208, 250),
         "lines": [
-            "باوەشێکی گەرم و ئارام ☁️",
-            "باوەشێک کە هەموو شتێک ئارام دەکاتەوە 🤍",
-            "باوەشێکی توند و پڕ لە خۆشەویستی 💗",
-            "باوەشێکی نەرم وەک هەور ☁️",
+            "A warm and calm hug ☁️",
+            "A hug that makes everything okay 🤍",
+            "A tight hug full of love 💗",
+            "A soft hug, like a cloud ☁️",
         ],
-        "count": "جار باوەشی پێداکردووە",
+        "count": "hugs",
     },
     "pat": {
         "words": ["pat", "naz"],
@@ -4811,13 +4891,23 @@ _love_last = {}
 _LOVE_ACTION_WORDS = {w: k for k, v in LOVE_ACTIONS.items() for w in v["words"]}
 
 
+# (from, to, weight) - high numbers are rare. Weights are relative (they do not have to add up to 100).
+SHIP_WEIGHTS = [
+    (90, 99, 5), (80, 89, 10), (70, 79, 15), (60, 69, 20), (50, 59, 25),
+    (40, 49, 30), (30, 39, 35), (20, 29, 40), (10, 19, 45), (0, 9, 50),
+]
+
+
 def love_percent(a_id, b_id):
-    """ڕێژەی نێوان دوو کەس، هەموو ڕۆژێک نوێ دەبێتەوە، A&B و B&A هەمان ڕێژەیان هەیە"""
+    """Percent for a pair. Same pair = same number for the whole day (Iraq time),
+    A&B and B&A are equal. The number follows SHIP_WEIGHTS (90s are rare)."""
     import hashlib
     x, y = sorted((int(a_id), int(b_id)))
     day = xp_period_keys()["d"]
     h = hashlib.sha256(f"{x}:{y}:{day}".encode()).digest()
-    return int.from_bytes(h[:4], "big") % 101
+    rng = random.Random(int.from_bytes(h[:8], "big"))
+    lo, hi, _ = rng.choices(SHIP_WEIGHTS, weights=[w[2] for w in SHIP_WEIGHTS], k=1)[0]
+    return rng.randint(lo, hi)
 
 
 def love_status(p, gid=None):
@@ -4856,6 +4946,13 @@ def love_embed(a, b, gid=None, p=None):
     return e
 
 
+def ship_embed(a, b, p):
+    """Nothing but a styled 'Ship' title, the two tags and the picture."""
+    e = discord.Embed(description=f"# 𝓢𝓱𝓲𝓹\n{a.mention}  {b.mention}",
+                      color=discord.Color.from_rgb(190, 24, 45))
+    return e
+
+
 def love_count(gid, a_id, b_id, action):
     """ژمارەی جارەکان، A بۆ B (لە یەک ئاراستەدا) و دەیگەڕێنێتەوە"""
     global _xp_dirty
@@ -4883,10 +4980,13 @@ def action_embed(a, b, action, n):
 async def love_on_message(message):
     if message.author.bot or message.guild is None or not message.content:
         return
-    parts = message.content.strip().split()
-    if not parts:
+    # STRICT: the message may only hold the command word + mentions.
+    # "ship ladawa", "kisss", "hug please" ... are normal chat, nothing happens.
+    tokens = message.content.strip().split()
+    rest = [t.lower() for t in tokens if not _MENTION_RX.match(t)]
+    if len(rest) != 1:
         return
-    word = parts[0].lower()
+    word = rest[0]
     is_love = word in LOVE_WORDS
     action = _LOVE_ACTION_WORDS.get(word)
     if not is_love and not action:
@@ -4915,7 +5015,7 @@ async def love_on_message(message):
             pass
 
     if not targets:
-        if len(parts) == 1:        # تەنها وشەکە بەتەنیا، ڕێنمایی بکە
+        if len(tokens) == 1:        # تەنها وشەکە بەتەنیا، ڕێنمایی بکە
             await hint("کەسێک mention بکە 🌷")
         return
 
@@ -4928,15 +5028,15 @@ async def love_on_message(message):
     try:
         if is_love:
             a, b = (targets[0], targets[1]) if len(targets) >= 2 else (me, targets[0])
-            embed = love_embed(a, b, message.guild.id)
             p = 100 if a.id == b.id else love_percent(a.id, b.id)
+            embed = ship_embed(a, b, p)
             f = await ship_file(a, b, p)
             if f:
-                embed.set_thumbnail(url=None)
                 embed.set_image(url="attachment://ship.png")
                 await message.reply(embed=embed, file=f, mention_author=False,
                                     allowed_mentions=discord.AllowedMentions.none())
                 return
+            embed.description += f"\n## {p}%"      # Pillow missing -> percent as text
         else:
             b = targets[0]
             if b.id == me.id:
@@ -7266,6 +7366,57 @@ def mod_text(gid, key, user=""):
     return t.replace("{user}", user)
 
 
+# ---------------------------------------------------------
+# Timed mute: mute @k 6h  ->  when the time ends the bot removes the Muted role itself
+# ---------------------------------------------------------
+@_tasks.loop(seconds=5)
+async def timed_mute_loop():
+    now = time.time()
+    for gid_s in list(config.keys()):
+        d = config.get(gid_s)
+        if not isinstance(d, dict) or not d.get("timed_mutes"):
+            continue
+        try:
+            guild = bot.get_guild(int(gid_s))
+        except Exception:
+            continue
+        if guild is None:
+            continue
+        for uid_s, end in list(d["timed_mutes"].items()):
+            if end > now:
+                continue
+            drop = True
+            try:
+                uid = int(uid_s)
+                member = guild.get_member(uid)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(uid)
+                    except discord.NotFound:
+                        member = None
+                role = get_mute_role(guild)
+                if member and role and role in member.roles:
+                    mark_cmd_mute(uid)
+                    await member.remove_roles(role, reason="Timed mute ended")
+                    await log_mute_event(guild, member, "Auto (time ended)", False, via="Timed mute")
+            except discord.Forbidden:
+                print(f"timed unmute: no permission for {uid_s} in {gid_s}", flush=True)
+            except Exception as e:
+                print(f"timed unmute error: {e}", flush=True)
+                drop = False          # temporary problem (network...) -> try again in 5s
+            if drop:
+                d["timed_mutes"].pop(uid_s, None)
+                save_config()
+
+
+async def timed_mute_start():
+    if not timed_mute_loop.is_running():
+        timed_mute_loop.start()
+
+
+bot.add_listener(timed_mute_start, "on_ready")
+
+
 def comod_embed(guild):
     c = cfg(guild.id)
     e = discord.Embed(title="⚙️ /change-comod", color=discord.Color.blurple(),
@@ -7626,7 +7777,121 @@ async def love_fetch_api(action):
     return None
 
 
+# ---- built-in girl+girl gifs (permanent, inside the bot file) ----
+BUILTIN_KISS_GIFS = [
+    "https://media.giphy.com/media/tHcHVKlzGGNxe/giphy.gif",
+    "https://media.giphy.com/media/9eP6t7cQ7yvTXwx9QE/giphy.gif",
+    "https://media.giphy.com/media/EVODaJHSXZGta/giphy.gif",
+    "https://media.giphy.com/media/KjSdLPyb8xmiQ/giphy.gif",
+    "https://tenor.com/view/yuri-gif-7747709184111589686",
+    "https://tenor.com/view/yuri-anime-kiss-gif-5999933",
+    "https://tenor.com/view/test-gif-25730394",
+    "https://tenor.com/view/wow-gif-25687305",
+    "https://tenor.com/view/sakura-trick-sakura-trick-kiss-yuri-gif-14041835",
+    "https://tenor.com/view/kiss-gif-19578060",
+    "https://tenor.com/view/yuzu-x-mei10-citrus-gif-20393512",
+    "https://tenor.com/view/sakura-trick-yuu-sonoda-haruka-takayama-yuri-kiss-gif-26908689",
+    "https://tenor.com/view/anime-kiss-gif-9925706624707965545",
+    "https://tenor.com/view/sakura-trick-kiss-yuri-gif-11487318",
+    "https://tenor.com/view/fragtime-haruka-murakami-misuzu-moritani-wlw-anime-shoujo-ai-gif-13658221851652333290",
+    "https://tenor.com/view/sakura-trick-kiss-yuri-gif-22001881",
+    "https://tenor.com/view/kanamemo-girls-love-kiss-anime-forehead-kiss-gif-1455808889309303149",
+    "https://tenor.com/view/yuri-kiss-shoujo-ai-gif-10600549",
+    "https://tenor.com/view/yuri-kissing-watanere-kiss-yuri-gif-7298411771800578519",
+    "https://tenor.com/view/kiss-anime-engage-kiss-maribel-hearn-usami-renko-gif-15812160006411953887",
+    "https://tenor.com/view/valkyrie-drive-valkyrie-drive-mermaid-kiss-kissing-girls-kissing-gif-10002268503274426008",
+    "https://tenor.com/view/lesbian-yuri-kiss-anime-gif-23631557",
+    "https://tenor.com/view/kiss-gif-27712459",
+    "https://tenor.com/view/tensei-oujo-anisphia-wynn-palletia-euphyllia-fez-palletia-euphy-x-anis-yuri-gif-15324089819850746599",
+    "https://tenor.com/view/anime-kiss-gif-3810977707923561878",
+    "https://tenor.com/view/yuri-gif-24238090",
+    "https://tenor.com/view/girls-lesbian-kissing-anime-kiss-gif-17722211",
+    "https://tenor.com/view/girls-lesbian-kissing-anime-kiss-gif-17722209",
+    "https://tenor.com/view/lesbian-gif-22079224",
+    "https://tenor.com/view/lesbian-gif-22079299",
+    "https://tenor.com/view/lesbian-gif-22079220",
+    "https://tenor.com/view/lesbian-gif-22090322",
+    "https://tenor.com/view/lesbian-gif-22079307",
+    "https://tenor.com/view/lesbian-gif-22079225",
+    "https://tenor.com/view/lesbian-gif-22079242",
+    "https://tenor.com/view/kiss-lesbian-gif-21198433",
+    "https://tenor.com/view/kiss-kissing-lesbian-anime-strawberry-panic-gif-9155305389744741940",
+    "https://tenor.com/view/mizuena-enamizu-mzen-making-out-mizuena-kissing-gif-9080007557916989484",
+    "https://tenor.com/view/renako-mai-kiss-kisses-freak-out-gif-13220785228267010349",
+    "https://media.giphy.com/media/53XdAUCpoxuZP4syEB/giphy.gif",
+    "https://media.giphy.com/media/jpwJYoJ9dn0dhv6eEc/giphy.gif",
+    "https://media.giphy.com/media/zq65tz6r23cSpptzPA/giphy.gif",
+    "https://media.giphy.com/media/eO3A855pbMbS9mZkme/giphy.gif",
+]
+
+BUILTIN_HUG_GIFS = [
+    "https://tenor.com/view/love-hug-anime-gif-20942848",
+    "https://tenor.com/view/hug-gif-18312134330477465894",
+    "https://tenor.com/view/kumirei-gif-1667587534058049632",
+    "https://tenor.com/view/anime-hug-snuggle-cuddle-yuri-gif-23288514",
+    "https://tenor.com/view/hug-anime-hug-anime-yuri-gif-5321727283049878595",
+    "https://tenor.com/view/yuru-yuri-yuru-yuri-hug-kyoko-gif-26492703",
+    "https://tenor.com/view/virgin-road-anime-nuzzle-gif-25498703",
+    "https://tenor.com/view/hug-anime-hug-anime-cute-uwu-gif-17264448",
+    "https://tenor.com/view/anime-drawing-cuddle-hug-couple-gif-9760813949807541328",
+    "https://tenor.com/view/yuri-love-zxechy-gif-1744421073646080905",
+    "https://tenor.com/view/sakura-trick-hug-shoujo-ai-gif-7254556512884855666",
+    "https://tenor.com/view/hug-gif-8483399248689121172",
+    "https://media.giphy.com/media/MjMWJWEsR8nPBIJg6K/giphy.gif",
+    "https://media.giphy.com/media/xPCdpJ59QxJYSvS6Yx/giphy.gif",
+    "https://media.giphy.com/media/pSRXlYRZudUvx7ozse/giphy.gif",
+]
+
+# One-time clean-up: old kiss/hug gifs saved in the config (mixed boy/girl) are removed,
+# so ONLY the built-in girl+girl list above (and links you add later) are used.
+if not config.get("_kiss_hug_gifs_purged_v1"):
+    for _gid, _d in list(config.items()):
+        if isinstance(_d, dict) and isinstance(_d.get("love_gifs"), dict):
+            for _act in ("kiss", "hug"):
+                _d["love_gifs"][_act] = {}
+    config["_kiss_hug_gifs_purged_v1"] = True
+    save_config()
+
+LESBIAN_ONLY = ("kiss", "hug")     # these two use ONLY the girl+girl ("ff") pool
+_GIF_FILE_CACHE = {}
+_last_gif = {}
+
+
+def _file_gifs(action):
+    """Extra links from  kiss_gifs.txt / hug_gifs.txt  (next to bot.py, any text, links found automatically)"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{action}_gifs.txt")
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return []
+    cached = _GIF_FILE_CACHE.get(action)
+    if not cached or cached[0] != mt:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                urls = list(dict.fromkeys(re.findall(r"https?://\S+", f.read())))
+        except Exception:
+            urls = []
+        _GIF_FILE_CACHE[action] = (mt, urls)
+    return _GIF_FILE_CACHE[action][1]
+
+
+def lesbian_pool(guild, action):
+    own = cfg(guild.id)["love_gifs"].get(action, {}).get("ff", [])
+    built = BUILTIN_KISS_GIFS if action == "kiss" else BUILTIN_HUG_GIFS if action == "hug" else []
+    return list(dict.fromkeys(list(built) + list(own) + _file_gifs(action)))
+
+
 async def love_pick_gif(guild, a, b, action):
+    if action in LESBIAN_ONLY:
+        pool = lesbian_pool(guild, action)
+        if not pool:
+            print(f"⚠ {action}: girl+girl gif list is empty - add links with /love-gifs-import", flush=True)
+            return None
+        pick = random.choice(pool)
+        if len(pool) > 1 and pick == _last_gif.get((guild.id, action)):
+            pick = random.choice([g for g in pool if g != pick])
+        _last_gif[(guild.id, action)] = pick
+        return pick
     c = cfg(guild.id)
     pools = c["love_gifs"].get(action, {})
     pair = love_pair(a, b)
@@ -7651,6 +7916,8 @@ def gif_embed_apply(embed, gif):
 
 
 def lovegifs_embed(guild, action, pair):
+    if action in LESBIAN_ONLY:
+        pair = "ff"
     c = cfg(guild.id)
     g = c["love_gifs"]
     lines = []
@@ -7682,7 +7949,7 @@ class LoveGifAddModal(discord.ui.Modal):
         pool = cfg(self.v.guild.id)["love_gifs"].setdefault(self.v.action, {}).setdefault(self.v.pair, [])
         n = 0
         for u in urls:
-            if u not in pool and len(pool) < 500:
+            if u not in pool and len(pool) < 2000:
                 pool.append(u); n += 1
         save_config()
         await interaction.response.edit_message(embed=lovegifs_embed(self.v.guild, self.v.action, self.v.pair),
@@ -7728,6 +7995,8 @@ class LoveGenderSelect(discord.ui.RoleSelect):
 class LoveGifView(SecBaseView):
     def __init__(self, guild, author_id, action="kiss", pair="ff"):
         super().__init__(guild, author_id)
+        if action in LESBIAN_ONLY:
+            pair = "ff"            # kiss / hug = girl+girl only
         self.action, self.pair = action, pair
         self.add_item(LoveGifActionSelect(action)); self.add_item(LoveGifPairSelect(pair))
         self.add_item(LoveGenderSelect("f", 2)); self.add_item(LoveGenderSelect("m", 3))
@@ -7756,6 +8025,31 @@ async def love_gifs_cmd(interaction: discord.Interaction):
         await deny_interaction(interaction); return
     await interaction.response.send_message(embed=lovegifs_embed(interaction.guild, "kiss", "ff"),
                                             view=LoveGifView(interaction.guild, interaction.user.id), ephemeral=True)
+
+
+@bot.tree.command(name="love-gifs-import", description="Add many girl+girl gif links for kiss / hug from a .txt file")
+@app_commands.guild_only()
+@app_commands.describe(action="kiss or hug", file=".txt file - links anywhere inside, one per line is best")
+@app_commands.choices(action=[app_commands.Choice(name="kiss", value="kiss"),
+                              app_commands.Choice(name="hug", value="hug")])
+async def love_gifs_import_cmd(interaction: discord.Interaction, action: app_commands.Choice[str], file: discord.Attachment):
+    if not is_dev(interaction.user):
+        await deny_interaction(interaction); return
+    if file.size > 2_000_000:
+        await interaction.response.send_message("❌ File is too big (max 2MB).", ephemeral=True); return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        text = (await file.read()).decode("utf-8", errors="ignore")
+    except Exception as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True); return
+    urls = list(dict.fromkeys(re.findall(r"https?://\S+", text)))
+    pool = cfg(interaction.guild.id)["love_gifs"].setdefault(action.value, {}).setdefault("ff", [])
+    added = 0
+    for u in urls:
+        if u not in pool and len(pool) < 2000:
+            pool.append(u); added += 1
+    save_config()
+    await interaction.followup.send(f"✅ {action.value}: **{added}** new links added, total girl+girl: **{len(pool)}**", ephemeral=True)
 
 
 # ---------------------------------------------------------
@@ -7834,29 +8128,27 @@ def _ship_circle(img_bytes, d, ring=8):
 
 
 def make_ship_png(a_bytes, b_bytes, percent):
-    W, H = 1000, 400
-    bg = Image.new("RGBA", (W, H)); px = ImageDraw.Draw(bg)
-    for x in range(W):
-        k = x / W
-        px.line([(x, 0), (x, H)], fill=(int(48 + 30 * k), int(20 + 8 * k), int(62 - 10 * k), 255))
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse([300, 40, 700, 380], fill=(255, 60, 110, 110))
-    bg = Image.alpha_composite(bg, glow.filter(ImageFilter.GaussianBlur(70)))
-    D = 310
-    for img_bytes, cx in ((a_bytes, 185), (b_bytes, 815)):
-        sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        ImageDraw.Draw(sh).ellipse([cx - D // 2, H // 2 - D // 2 + 12, cx + D // 2, H // 2 + D // 2 + 12], fill=(0, 0, 0, 140))
-        bg = Image.alpha_composite(bg, sh.filter(ImageFilter.GaussianBlur(14)))
-        bg.alpha_composite(_ship_circle(img_bytes, D), (cx - D // 2, H // 2 - D // 2))
-    hs = 330
-    heart = _glass_heart(hs, f"{percent}%")
-    shadow = Image.new("RGBA", heart.size, (60, 0, 20, 255)); shadow.putalpha(heart.getchannel("A").point(lambda v: int(v * 0.55)))
-    hsh = Image.new("RGBA", (W, H), (0, 0, 0, 0)); hsh.alpha_composite(shadow, (W // 2 - hs // 2, H // 2 - hs // 2 + 14))
-    bg = Image.alpha_composite(bg, hsh.filter(ImageFilter.GaussianBlur(16)))
-    bg.alpha_composite(heart, (W // 2 - hs // 2, H // 2 - hs // 2 - 6))
-    rm = Image.new("L", (W, H), 0); ImageDraw.Draw(rm).rounded_rectangle([0, 0, W - 1, H - 1], 36, fill=255)
-    bg.putalpha(rm)
-    out = _io.BytesIO(); bg.save(out, "PNG", optimize=True)
+    """Two square pictures side by side, a flat red heart with the % in the middle,
+    transparent background (same look as the example picture)."""
+    S, GAP = 390, 110
+    W, H = S * 2 + GAP, S
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    for img_bytes, x in ((a_bytes, 0), (b_bytes, S + GAP)):
+        im = Image.open(_io.BytesIO(img_bytes)).convert("RGBA").resize((S, S), Image.LANCZOS)
+        canvas.alpha_composite(im, (x, 0))
+    hw, hh, K = 262, 246, 4
+    mask = _heart_mask(hw * K, hh * K, 0)
+    heart = Image.new("RGBA", (hw * K, hh * K), (190, 24, 45, 255))
+    heart.putalpha(mask)
+    text = f"{percent}%"
+    f = _ship_font(int(hh * K * (0.30 if len(text) <= 3 else 0.25)))
+    d = ImageDraw.Draw(heart)
+    bb = d.textbbox((0, 0), text, font=f)
+    d.text(((hw * K - (bb[2] - bb[0])) / 2 - bb[0], hh * K * 0.44 - (bb[3] - bb[1]) / 2 - bb[1]),
+           text, font=f, fill=(255, 255, 255, 255))
+    heart = heart.resize((hw, hh), Image.LANCZOS)
+    canvas.alpha_composite(heart, (W // 2 - hw // 2, H // 2 - hh // 2))
+    out = _io.BytesIO(); canvas.save(out, "PNG", optimize=True)
     return out.getvalue()
 
 
@@ -7865,8 +8157,8 @@ async def ship_file(a, b, percent):
     if not PIL_OK:
         return None
     try:
-        ab = await a.display_avatar.replace(size=256, format="png").read()
-        bb = await b.display_avatar.replace(size=256, format="png").read()
+        ab = await a.display_avatar.replace(size=512, format="png").read()
+        bb = await b.display_avatar.replace(size=512, format="png").read()
         png = await asyncio.to_thread(make_ship_png, ab, bb, percent)
         return discord.File(_io.BytesIO(png), filename="ship.png")
     except Exception as e:
