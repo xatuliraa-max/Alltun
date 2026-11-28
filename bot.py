@@ -4834,10 +4834,10 @@ LOVE_ACTIONS = {
         "title": "Kiss",
         "color": (255, 205, 222),
         "lines": [
-            "A soft kiss on the cheek 🤍",
-            "A tiny, quiet kiss ✨",
-            "A kiss landed like a butterfly 🦋",
-            "A sweet and shy kiss 🌷",
+            "A soft kiss on the cheek",
+            "A tiny, quiet kiss",
+            "A kiss landed like a butterfly",
+            "A sweet and shy kiss",
         ],
         "count": "kisses",
     },
@@ -4847,10 +4847,10 @@ LOVE_ACTIONS = {
         "title": "Hug",
         "color": (224, 208, 250),
         "lines": [
-            "A warm and calm hug ☁️",
-            "A hug that makes everything okay 🤍",
-            "A tight hug full of love 💗",
-            "A soft hug, like a cloud ☁️",
+            "A warm and calm hug",
+            "A hug that makes everything okay",
+            "A tight hug full of love",
+            "A soft hug, like a cloud",
         ],
         "count": "hugs",
     },
@@ -4967,7 +4967,7 @@ def action_embed(a, b, action, n):
     spec = LOVE_ACTIONS[action]
     desc = (
         "₊˚⊹ ♡ ⋆｡˚ ✧ ˚｡⋆ ♡ ⊹˚₊\n\n"
-        f"{a.mention}  {spec['emoji']}  {b.mention}\n\n"
+        f"{a.mention}  {'♡' if action in LESBIAN_ONLY else spec['emoji']}  {b.mention}\n\n"
         f"{random.choice(spec['lines'])}\n\n"
         f"-# ⋆ {n} {spec['count']} ⋆"
     )
@@ -5045,6 +5045,7 @@ async def love_on_message(message):
             n = love_count(message.guild.id, me.id, b.id, action)
             embed = action_embed(me, b, action, n)
             gif = await love_pick_gif(message.guild, me, b, action)
+            gif = await resolve_gif_url(gif)
             inline = gif_embed_apply(embed, gif)
             await message.reply(embed=embed, mention_author=False,
                                 allowed_mentions=discord.AllowedMentions.none())
@@ -7736,7 +7737,7 @@ _GIF_APIS = (
     ("https://nekos.best/api/v2/{a}", lambda j: j["results"][0]["url"]),
     ("https://api.waifu.pics/sfw/{a}", lambda j: j["url"]),
 )
-_DIRECT_RX = re.compile(r"\.(?:gif|png|jpe?g|webp)(?:\?\S*)?$|media\.tenor\.com/|media\d*\.giphy\.com/|i\.imgur\.com/", re.I)
+_DIRECT_RX = re.compile(r"\.(?:gif|png|jpe?g|webp)(?:\?\S*)?$|media\d*\.tenor\.com/|media\d*\.giphy\.com/|i\.imgur\.com/", re.I)
 
 
 def love_gender(member):
@@ -7905,6 +7906,40 @@ async def love_pick_gif(guild, a, b, action):
         if g:
             return g
     return random.choice(own) if own else None
+
+
+_TENOR_PAGE_RX = (
+    re.compile(r'<meta[^>]+property="og:image"[^>]+content="(https://media\d*\.tenor\.com/[^"]+?\.gif)"', re.I),
+    re.compile(r'<meta[^>]+content="(https://media\d*\.tenor\.com/[^"]+?\.gif)"[^>]+property="og:image"', re.I),
+    re.compile(r'<meta[^>]+(?:name|property)="twitter:image"[^>]+content="(https://media\d*\.tenor\.com/[^"]+?\.gif)"', re.I),
+    re.compile(r'(https://media\d*\.tenor\.com/[^"\'\s<>\\]+?\.gif)', re.I),
+)
+
+
+async def resolve_gif_url(url):
+    """tenor.com/view/... cannot be shown inside an embed, so the real .gif link is read
+    from the Tenor page once and remembered (saved in config). Falls back to the old link."""
+    if not url or "tenor.com/view/" not in url:
+        return url
+    cache = config.setdefault("_tenor_cache", {})
+    if url in cache:
+        return cache[url]
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6),
+                                         headers={"User-Agent": "Mozilla/5.0"}) as sess:
+            async with sess.get(url) as r:
+                if r.status != 200:
+                    return url
+                html = await r.text()
+        for rx in _TENOR_PAGE_RX:
+            m = rx.search(html)
+            if m:
+                cache[url] = m.group(1).replace("&amp;", "&")
+                save_config()
+                return cache[url]
+    except Exception as e:
+        print(f"tenor resolve error: {e}", flush=True)
+    return url
 
 
 def gif_embed_apply(embed, gif):
